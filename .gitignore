@@ -1,0 +1,21 @@
+# Python environment
+.venv/
+__pycache__/
+*.pyc
+
+# Audio recordings
+*.wav
+
+# Datasets and backups
+dataset/
+dataset_new/
+dataset_backup/
+dataset_mono_test/
+processed_audio/
+
+# Temporary and generated files
+*.png
+*.tmp
+
+# Old dataset CSV
+whispryn_dataset.csv
