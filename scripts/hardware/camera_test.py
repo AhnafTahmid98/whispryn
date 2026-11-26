@@ -1,15 +1,3 @@
-
-"""
-WHISPRYN - Raspberry Pi 5 Camera Test
-
-Hardware:
-    Raspberry Pi 5
-    Camera Module 2 NoIR (IMX219), CAM1
-
-OS: Ubuntu 24.04
-Uses: rpicam-apps + OpenCV
-"""
-
 import subprocess
 import shutil
 from pathlib import Path
