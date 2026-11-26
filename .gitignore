@@ -19,3 +19,6 @@ processed_audio/
 
 # Old dataset CSV
 whispryn_dataset.csv
+
+# Local camera outputs
+/runtime/
