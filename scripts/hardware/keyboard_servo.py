@@ -1,110 +1,106 @@
-
+import math
 import os
+import select
 import sys
+import termios
 import time
 import tty
-import termios
-import select
 
 from smbus import SMBus
 from luma.core.interface.serial import i2c
 from luma.core.render import canvas
 from luma.oled.device import ssd1306
 
-# WHISPRYN confirmed connections
 PCA_BUS = 1
-PCA_ADDR = 0x40
+PCA_ADDRESS = 0x40
 PAN_CHANNEL = 3
 TILT_CHANNEL = 2
 
 OLED_BUS = 3
-OLED_ADDR = 0x3C
-
+OLED_ADDRESS = 0x3C
 PWM_HZ = 50
-STEP_US = 10
 
-# Temporary electrical safeguards,
-# NOT calibrated mechanical travel limits.
-PULSE_MIN = 1000
-PULSE_MAX = 2000
+# Electrical safeguards, not mechanical limits
+MIN_PULSE_US = 1000
+MAX_PULSE_US = 2000
+ARM_PULSE_US = 1500
 
-# Electrical reference only, NOT physical centre.
-START_PULSE = 1500
+# Adjustable speed and movement steps
+SPEED_CHOICES = (3, 5, 10, 20, 30)
+STEP_CHOICES = (1, 2, 5, 10)
 
-channels = {
+CHANNELS = {
     "pan": PAN_CHANNEL,
     "tilt": TILT_CHANNEL,
 }
 
-positions = {"pan": None, "tilt": None}
 
-
-def configure_pwm(bus):
-    old = bus.read_byte_data(PCA_ADDR, 0x00)
+def configure_pca9685(bus):
+    old = bus.read_byte_data(PCA_ADDRESS, 0x00)
 
     bus.write_byte_data(
-        PCA_ADDR, 0x00, (old & 0x7F) | 0x10
+        PCA_ADDRESS, 0x00, (old & 0x7F) | 0x10
     )
 
     prescale = round(
         25_000_000 / (4096 * PWM_HZ)
     ) - 1
 
-    bus.write_byte_data(PCA_ADDR, 0xFE, prescale)
+    bus.write_byte_data(PCA_ADDRESS, 0xFE, prescale)
 
     wake = (old & 0x6F) | 0x20
-    bus.write_byte_data(PCA_ADDR, 0x00, wake)
+    bus.write_byte_data(PCA_ADDRESS, 0x00, wake)
 
     time.sleep(0.01)
 
     bus.write_byte_data(
-        PCA_ADDR, 0x00, wake | 0x80
+        PCA_ADDRESS, 0x00, wake | 0x80
     )
 
 
-def set_pulse(bus, channel, pulse):
-    ticks = round(pulse * 4096 * PWM_HZ / 1_000_000)
-    reg = 0x06 + 4 * channel
+def angle_to_pulse(angle):
+    return MIN_PULSE_US + (
+        MAX_PULSE_US - MIN_PULSE_US
+    ) * angle / 180.0
+
+
+def pulse_ticks(pulse_us):
+    return round(
+        pulse_us * 4096 * PWM_HZ / 1_000_000
+    )
+
+
+def set_pwm(bus, channel, pulse_us):
+    ticks = pulse_ticks(pulse_us)
+    register = 0x06 + 4 * channel
 
     bus.write_i2c_block_data(
-        PCA_ADDR,
-        reg,
-        [0, 0, ticks & 255, (ticks >> 8) & 15],
+        PCA_ADDRESS,
+        register,
+        [0, 0, ticks & 0xFF, (ticks >> 8) & 0x0F]
     )
 
+    return ticks
 
-def disable(bus, channel):
-    reg = 0x06 + 4 * channel
+
+def disable_pwm(bus, channel):
+    register = 0x06 + 4 * channel
+
     bus.write_i2c_block_data(
-        PCA_ADDR, reg, [0, 0, 0, 0x10]
+        PCA_ADDRESS,
+        register,
+        [0, 0, 0, 0x10]
     )
-
-
-def screen(oled, status):
-    with canvas(oled) as draw:
-        draw.text((15, 1), "WHISPRYN", fill="white")
-        draw.line((0, 17, 127, 17), fill="white")
-
-        for axis, y in [("pan", 23), ("tilt", 37)]:
-            pulse = positions[axis]
-            value = "--" if pulse is None else str(pulse)
-            draw.text(
-                (5, y),
-                f"{axis.upper()}: {value} us",
-                fill="white"
-            )
-
-        draw.text((5, 52), status[:21], fill="white")
 
 
 def read_key(fd):
-    key = os.read(fd, 1)
+    raw = os.read(fd, 1)
 
-    if key == b"\x1b":
+    if raw == b"\x1b":
         sequence = b""
 
         for _ in range(2):
-            if select.select([fd], [], [], 0.1)[0]:
+            if select.select([fd], [], [], 0.08)[0]:
                 sequence += os.read(fd, 1)
 
         return {
@@ -114,162 +110,416 @@ def read_key(fd):
             b"[D": "a",
         }.get(sequence, "")
 
-    return key.decode(errors="ignore").lower()
+    return raw.decode(
+        "utf-8", errors="ignore"
+    ).lower()
 
 
-def move(bus, oled, axis, change):
-    current = positions[axis]
+def oled_screen(oled, current, speed, step):
+    with canvas(oled) as draw:
+        draw.text(
+            (17, 0), "WHISPRYN", fill="white"
+        )
 
-    if current is None:
-        print(f"\nArm {axis.upper()} first.")
-        return
+        draw.line(
+            (0, 14, 127, 14), fill="white"
+        )
 
-    target = max(
-        PULSE_MIN,
-        min(PULSE_MAX, current + change)
-    )
+        for axis, y in (
+            ("pan", 18),
+            ("tilt", 30)
+        ):
+            angle = current[axis]
 
-    if target == current:
-        print("\nElectrical command safeguard reached.")
-        return
+            value = (
+                "--" if angle is None
+                else f"{angle:.1f}"
+            )
 
-    set_pulse(bus, channels[axis], target)
-    positions[axis] = target
+            draw.text(
+                (2, y),
+                f"{axis.upper()}: {value} deg*",
+                fill="white"
+            )
 
-    screen(oled, "MANUAL CONTROL")
+        draw.text(
+            (2, 43),
+            f"Speed: {speed} deg/s",
+            fill="white"
+        )
 
-    print(
-        f"\rPAN: {positions['pan']} us  "
-        f"TILT: {positions['tilt']} us    ",
-        end="",
-        flush=True
-    )
+        draw.text(
+            (2, 54),
+            f"Step: {step} deg",
+            fill="white"
+        )
 
 
 def main():
     if not sys.stdin.isatty():
-        raise SystemExit("Use an interactive terminal or SSH.")
+        raise SystemExit(
+            "Run from an interactive terminal."
+        )
 
-    bus = SMBus(PCA_BUS)
     fd = sys.stdin.fileno()
-    old_terminal = None
+    original_terminal = termios.tcgetattr(fd)
+
+    bus = None
     oled = None
+    terminal_raw = False
+
+    current = {
+        "pan": None,
+        "tilt": None
+    }
+
+    target = {
+        "pan": None,
+        "tilt": None
+    }
+
+    last_ticks = {
+        "pan": None,
+        "tilt": None
+    }
+
+    speed_idx = 1
+    step_idx = 1
+
+    def status_line():
+        def label(axis):
+            if current[axis] is None:
+                return "OFF"
+
+            return (
+                f"{current[axis]:.1f}"
+                f"->{target[axis]:.1f}"
+            )
+
+        print(
+            f"\rPAN {label('pan')} | "
+            f"TILT {label('tilt')} | "
+            f"Speed {SPEED_CHOICES[speed_idx]} deg/s | "
+            f"Step {STEP_CHOICES[step_idx]} deg   ",
+            end="",
+            flush=True
+        )
+
+    def enter_exact_target(axis):
+        nonlocal terminal_raw
+
+        if current[axis] is None:
+            print(
+                f"\nArm {axis.upper()} first."
+            )
+            return
+
+        target[axis] = current[axis]
+
+        termios.tcsetattr(
+            fd,
+            termios.TCSADRAIN,
+            original_terminal
+        )
+
+        terminal_raw = False
+
+        try:
+            value = input(
+                f"\n{axis.upper()} target "
+                "(nominal 0-180 degrees): "
+            ).strip()
+
+            try:
+                requested = float(value)
+            except ValueError:
+                print("Not a number.")
+                return
+
+            if (
+                not math.isfinite(requested)
+                or not 0 <= requested <= 180
+            ):
+                print(
+                    "Outside electrical reference range."
+                )
+                return
+
+            if abs(
+                requested - current[axis]
+            ) > 20:
+                confirmation = input(
+                    "Large move. Type YES to continue: "
+                )
+
+                if confirmation != "YES":
+                    print("Cancelled.")
+                    return
+
+            target[axis] = requested
+
+            print(
+                f"{axis.upper()} target: "
+                f"{requested:.1f} nominal degrees"
+            )
+
+        except EOFError:
+            print("\nCommand cancelled.")
+
+        finally:
+            tty.setcbreak(fd)
+            terminal_raw = True
 
     try:
-        for channel in channels.values():
-            disable(bus, channel)
+        bus = SMBus(PCA_BUS)
 
-        configure_pwm(bus)
+        for channel in CHANNELS.values():
+            disable_pwm(bus, channel)
+
+        configure_pca9685(bus)
 
         oled = ssd1306(
-            i2c(port=OLED_BUS, address=OLED_ADDR),
+            i2c(
+                port=OLED_BUS,
+                address=OLED_ADDRESS
+            ),
             width=128,
             height=64
         )
 
-        screen(oled, "OUTPUTS OFF")
-
-        print("\nWHISPRYN MANUAL SERVO TEST")
-        print("1 = Arm PAN (channel 3)")
-        print("2 = Arm TILT (channel 2)")
-        print("A/D = PAN -/+")
-        print("W/S = TILT +/-")
-        print("Arrow keys also work")
-        print("SPACE = Disable both outputs")
-        print("Q = Quit")
-        print("\nNo mechanical centre is assumed.")
+        print("\nWHISPRYN MANUAL SERVO CONTROL")
+        print("--------------------------------")
+        print("W/S : TILT up/down")
+        print("A/D : PAN left/right")
+        print("Z/X : Speed slower/faster")
+        print("N/M : Degree step smaller/larger")
+        print("P/T : Enter exact target angle")
+        print("1/2 : Arm PAN/TILT")
+        print("H   : Halt and hold")
+        print("SPACE : PWM off")
+        print("Q   : Quit")
+        print("--------------------------------")
+        print("No physical centre assumed.")
         print("First arm command uses 1500 us.")
-        print("It can cause a sudden movement.")
-        print("Clear the mechanism before arming.\n")
+        print("It may cause sudden movement.")
+        print("Clear mechanism before arming.\n")
 
-        old_terminal = termios.tcgetattr(fd)
+        last_frame = 0.0
+        last_time = time.monotonic()
+        arm_pending = None
+
         tty.setcbreak(fd)
-
-        pending = None
+        terminal_raw = True
 
         while True:
-            key = read_key(fd)
+            if select.select(
+                [fd], [], [], 0.02
+            )[0]:
+                key = read_key(fd)
 
-            # Confirm first activation of either servo.
-            if pending is not None:
-                if key == "y":
-                    set_pulse(
+                if key == "q":
+                    break
+
+                elif key == " ":
+                    for axis, channel in CHANNELS.items():
+                        disable_pwm(bus, channel)
+
+                        current[axis] = None
+                        target[axis] = None
+                        last_ticks[axis] = None
+
+                    arm_pending = None
+                    print("\nPWM disabled.")
+
+                elif arm_pending is not None:
+                    axis = arm_pending
+                    arm_pending = None
+
+                    if key == "y":
+                        tick = set_pwm(
+                            bus,
+                            CHANNELS[axis],
+                            ARM_PULSE_US
+                        )
+
+                        # Electrical reference only.
+                        # NOT the physical centre.
+                        current[axis] = 90.0
+                        target[axis] = 90.0
+                        last_ticks[axis] = tick
+
+                        print(
+                            f"\n{axis.upper()} armed "
+                            f"at {ARM_PULSE_US} us."
+                        )
+
+                    else:
+                        print("\nArming cancelled.")
+
+                elif key in ("1", "2"):
+                    axis = (
+                        "pan" if key == "1"
+                        else "tilt"
+                    )
+
+                    if current[axis] is None:
+                        arm_pending = axis
+
+                        print(
+                            f"\nArm {axis.upper()} at "
+                            "1500 us? Press Y."
+                        )
+
+                elif key == "h":
+                    for axis in CHANNELS:
+                        if current[axis] is not None:
+                            target[axis] = current[axis]
+
+                    print(
+                        "\nMovement halted; holding."
+                    )
+
+                elif key in ("a", "d", "w", "s"):
+                    axis = (
+                        "pan"
+                        if key in ("a", "d")
+                        else "tilt"
+                    )
+
+                    if current[axis] is None:
+                        print(
+                            f"\nArm {axis.upper()} first."
+                        )
+
+                    else:
+                        direction = (
+                            1 if key in ("d", "w")
+                            else -1
+                        )
+
+                        target[axis] = max(
+                            0.0,
+                            min(
+                                180.0,
+                                current[axis]
+                                + direction
+                                * STEP_CHOICES[step_idx]
+                            )
+                        )
+
+                elif key == "z":
+                    speed_idx = max(
+                        0, speed_idx - 1
+                    )
+
+                elif key == "x":
+                    speed_idx = min(
+                        len(SPEED_CHOICES) - 1,
+                        speed_idx + 1
+                    )
+
+                elif key == "n":
+                    step_idx = max(
+                        0, step_idx - 1
+                    )
+
+                elif key == "m":
+                    step_idx = min(
+                        len(STEP_CHOICES) - 1,
+                        step_idx + 1
+                    )
+
+                elif key in ("p", "t"):
+                    enter_exact_target(
+                        "pan" if key == "p"
+                        else "tilt"
+                    )
+
+                    last_time = time.monotonic()
+
+                status_line()
+
+            now = time.monotonic()
+
+            dt = min(
+                max(0.0, now - last_time),
+                0.1
+            )
+
+            last_time = now
+
+            # Move gradually at selected speed.
+            for axis, channel in CHANNELS.items():
+                if current[axis] is None:
+                    continue
+
+                distance = (
+                    target[axis] - current[axis]
+                )
+
+                if abs(distance) < 0.0001:
+                    continue
+
+                step = min(
+                    abs(distance),
+                    SPEED_CHOICES[speed_idx] * dt
+                )
+
+                current[axis] += math.copysign(
+                    step,
+                    distance
+                )
+
+                pulse = angle_to_pulse(
+                    current[axis]
+                )
+
+                ticks = pulse_ticks(pulse)
+
+                if ticks != last_ticks[axis]:
+                    last_ticks[axis] = set_pwm(
                         bus,
-                        channels[pending],
-                        START_PULSE
-                    )
-                    positions[pending] = START_PULSE
-                    screen(oled, f"{pending.upper()} ARMED")
-                    print(
-                        f"\n{pending.upper()} armed at "
-                        f"{START_PULSE} us"
-                    )
-                else:
-                    print("\nArming cancelled.")
-
-                pending = None
-                continue
-
-            if key == "q":
-                break
-
-            elif key == " ":
-                for channel in channels.values():
-                    disable(bus, channel)
-
-                positions["pan"] = None
-                positions["tilt"] = None
-
-                screen(oled, "OUTPUTS OFF")
-                print("\nBoth outputs disabled.")
-
-            elif key in ("1", "2"):
-                axis = "pan" if key == "1" else "tilt"
-
-                if positions[axis] is None:
-                    pending = axis
-                    print(
-                        f"\nArm {axis.upper()} at "
-                        f"{START_PULSE} us? "
-                        "Press Y to confirm, "
-                        "any other key to cancel."
+                        channel,
+                        pulse
                     )
 
-            elif key == "a":
-                move(bus, oled, "pan", -STEP_US)
+            if now - last_frame >= 0.2:
+                oled_screen(
+                    oled,
+                    current,
+                    SPEED_CHOICES[speed_idx],
+                    STEP_CHOICES[step_idx]
+                )
 
-            elif key == "d":
-                move(bus, oled, "pan", STEP_US)
-
-            elif key == "w":
-                move(bus, oled, "tilt", STEP_US)
-
-            elif key == "s":
-                move(bus, oled, "tilt", -STEP_US)
-
-            time.sleep(0.04)
+                last_frame = now
 
     except KeyboardInterrupt:
         print("\nInterrupted.")
 
     finally:
-        if old_terminal is not None:
+        if terminal_raw:
             termios.tcsetattr(
-                fd, termios.TCSADRAIN, old_terminal
+                fd,
+                termios.TCSADRAIN,
+                original_terminal
             )
 
-        for channel in channels.values():
-            try:
-                disable(bus, channel)
-            except OSError:
-                pass
+        if bus is not None:
+            for channel in CHANNELS.values():
+                try:
+                    disable_pwm(bus, channel)
+                except OSError:
+                    pass
 
-        bus.close()
+            bus.close()
 
         if oled is not None:
             oled.clear()
 
-        print("\nWHISPRYN stopped. PWM disabled.")
+        print(
+            "\nWHISPRYN stopped. "
+            "PWM disabled."
+        )
 
 
 if __name__ == "__main__":
