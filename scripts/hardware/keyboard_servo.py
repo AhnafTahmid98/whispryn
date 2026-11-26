@@ -26,7 +26,7 @@ MAX_PULSE_US = 2000
 ARM_PULSE_US = 1500
 
 # Adjustable speed and movement steps
-SPEED_CHOICES = (3, 5, 10, 20, 30)
+SPEED_CHOICES = (3, 5, 10, 20, 30, 40, 60, 80)
 STEP_CHOICES = (1, 2, 5, 10)
 
 CHANNELS = {
