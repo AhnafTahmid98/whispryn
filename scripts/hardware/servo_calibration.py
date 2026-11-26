@@ -2,8 +2,8 @@
 """
 WHISPRYN - Pan/Tilt Calibration with OLED
 
-PAN:  PCA9685 channel 3
-TILT: PCA9685 channel 0
+PAN:  PCA9685 channel 0
+TILT: PCA9685 channel 2
 OLED: I2C bus 3, address 0x3C
 
 No automatic servo movement at startup.
@@ -23,8 +23,8 @@ PCA_ADDR = 0x40
 PCA_BUS = 1
 PWM_HZ = 50
 
-PAN_CHANNEL = 3
-TILT_CHANNEL = 0
+PAN_CHANNEL = 0
+TILT_CHANNEL = 2
 
 OLED_BUS = 3
 OLED_ADDR = 0x3C
@@ -206,8 +206,8 @@ def main():
         show_oled(oled, "CALIBRATION")
 
         print("\nWHISPRYN SERVO CALIBRATION")
-        print("PAN  = channel 3")
-        print("TILT = channel 0")
+        print("PAN  = channel 0")
+        print("TILT = channel 2")
         print("Commands:")
         print("  pan 90")
         print("  tilt 90")

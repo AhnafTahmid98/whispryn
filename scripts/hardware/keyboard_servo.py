@@ -22,8 +22,8 @@ from luma.oled.device import ssd1306
 PCA_BUS, PCA_ADDR = 1, 0x40
 OLED_BUS, OLED_ADDR = 3, 0x3C
 
-PAN_CHANNEL = 3
-TILT_CHANNEL = 0
+PAN_CHANNEL = 0
+TILT_CHANNEL = 2
 CHANNELS = {"pan": PAN_CHANNEL, "tilt": TILT_CHANNEL}
 
 PWM_HZ = 50
