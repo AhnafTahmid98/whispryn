@@ -1,5 +1,6 @@
 import time
 from smbus import SMBus
+from contextlib import closing
 
 I2C_BUS = 1
 PCA9685_ADDRESS = 0x40
@@ -69,7 +70,7 @@ def main():
     print("WHISPRYN SERVO IDENTIFICATION")
     print("=" * 42)
 
-    with SMBus(I2C_BUS) as bus:
+    with closing(SMBus(I2C_BUS)) as bus:
         configure_pca9685(bus)
 
         # Disable outputs before testing
