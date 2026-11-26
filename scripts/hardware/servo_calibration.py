@@ -3,7 +3,7 @@
 WHISPRYN - Pan/Tilt Calibration with OLED
 
 PAN:  PCA9685 channel 3
-TILT: PCA9685 channel 2
+TILT: PCA9685 channel 0
 OLED: I2C bus 3, address 0x3C
 
 No automatic servo movement at startup.
@@ -24,7 +24,7 @@ PCA_BUS = 1
 PWM_HZ = 50
 
 PAN_CHANNEL = 3
-TILT_CHANNEL = 2
+TILT_CHANNEL = 0
 
 OLED_BUS = 3
 OLED_ADDR = 0x3C
@@ -190,11 +190,12 @@ def main():
     oled = None
 
     try:
-        # Stop both outputs before configuration
+        # Configure first: it enables auto-increment, which
+        # the multi-byte disable_servo() writes depend on.
+        configure_pca(bus)
+
         for channel in CHANNELS.values():
             disable_servo(bus, channel)
-
-        configure_pca(bus)
 
         oled = ssd1306(
             i2c(port=OLED_BUS, address=OLED_ADDR),
@@ -206,7 +207,7 @@ def main():
 
         print("\nWHISPRYN SERVO CALIBRATION")
         print("PAN  = channel 3")
-        print("TILT = channel 2")
+        print("TILT = channel 0")
         print("Commands:")
         print("  pan 90")
         print("  tilt 90")

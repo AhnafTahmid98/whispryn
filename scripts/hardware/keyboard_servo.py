@@ -289,10 +289,12 @@ def main():
     try:
         bus = SMBus(PCA_BUS)
 
+        # Setup first: it enables auto-increment, which
+        # the multi-byte off() writes depend on.
+        setup(bus)
+
         for channel in CHANNELS.values():
             off(bus, channel)
-
-        setup(bus)
 
         oled = ssd1306(
             i2c(port=OLED_BUS, address=OLED_ADDR),
