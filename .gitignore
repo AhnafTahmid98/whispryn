@@ -22,3 +22,10 @@ whispryn_dataset.csv
 
 # Local camera outputs
 /runtime/
+
+# Public WHISPRYN canonical audio dataset
+!dataset/
+!dataset/**/
+!dataset/**/*.wav
+!dataset/*.csv
+!dataset/*.md
