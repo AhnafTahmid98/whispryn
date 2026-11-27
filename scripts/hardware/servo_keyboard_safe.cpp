@@ -1,0 +1,979 @@
+
+#include <linux/i2c-dev.h>
+#include <sys/ioctl.h>
+#include <sys/select.h>
+#include <termios.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <csignal>
+
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <filesystem>
+#include <fstream>
+#include <iostream>
+#include <optional>
+#include <stdexcept>
+#include <string>
+#include <thread>
+#include <array>
+#include <cctype>
+
+namespace fs = std::filesystem;
+
+// WHISPRYN hardware configuration
+constexpr int PCA_ADDR = 0x40;
+constexpr int PAN_CH = 0;
+constexpr int TILT_CH = 2;
+constexpr int PWM_HZ = 50;
+
+// Electrical safeguards, NOT mechanical limits
+constexpr double MIN_US = 1000;
+constexpr double MAX_US = 2000;
+
+const std::array<double, 8> speeds{
+    3, 5, 10, 20, 30, 40, 60, 80
+};
+
+const std::array<double, 4> steps{
+    1, 2, 5, 10
+};
+
+volatile std::sig_atomic_t running = 1;
+
+void stop_signal(int) {
+    running = 0;
+}
+
+// Linux I2C interface
+class I2C {
+    int fd_ = -1;
+
+public:
+    I2C(const char* device, int address) {
+        fd_ = ::open(device, O_RDWR);
+
+        if (fd_ < 0 ||
+            ::ioctl(fd_, I2C_SLAVE, address) < 0) {
+            throw std::runtime_error(
+                std::string("Cannot open/configure ") + device
+            );
+        }
+    }
+
+    void write_bytes(
+        const unsigned char* bytes,
+        size_t n
+    ) {
+        if (::write(fd_, bytes, n) !=
+            static_cast<ssize_t>(n)) {
+            throw std::runtime_error("I2C write failed");
+        }
+    }
+
+    void reg(unsigned char reg, unsigned char value) {
+        const unsigned char b[] = {reg, value};
+        write_bytes(b, 2);
+    }
+
+    unsigned char read_reg(unsigned char reg) {
+        write_bytes(&reg, 1);
+
+        unsigned char value = 0;
+
+        if (::read(fd_, &value, 1) != 1) {
+            throw std::runtime_error("I2C read failed");
+        }
+
+        return value;
+    }
+
+    ~I2C() {
+        if (fd_ >= 0) {
+            ::close(fd_);
+        }
+    }
+
+    I2C(const I2C&) = delete;
+    I2C& operator=(const I2C&) = delete;
+};
+
+// PCA9685 servo controller
+class PCA9685 {
+    I2C dev_{"/dev/i2c-1", PCA_ADDR};
+
+public:
+    PCA9685() {
+        const auto old = dev_.read_reg(0x00);
+
+        // Enter sleep mode
+        dev_.reg(
+            0x00,
+            (old & 0x7f) | 0x10
+        );
+
+        // Configure 50 Hz PWM
+        dev_.reg(
+            0xfe,
+            static_cast<unsigned char>(
+                std::lround(
+                    25000000.0 / (4096 * PWM_HZ)
+                ) - 1
+            )
+        );
+
+        // Enable auto-increment
+        const auto wake =
+            static_cast<unsigned char>(
+                (old & 0x6f) | 0x20
+            );
+
+        dev_.reg(0x00, wake);
+
+        std::this_thread::sleep_for(
+            std::chrono::milliseconds(10)
+        );
+
+        dev_.reg(0x00, wake | 0x80);
+
+        // No automatic positioning
+        off(PAN_CH);
+        off(TILT_CH);
+    }
+
+    void pulse(int ch, double us) {
+        if (!std::isfinite(us) ||
+            us < MIN_US ||
+            us > MAX_US) {
+            throw std::runtime_error(
+                "Pulse outside electrical safeguards"
+            );
+        }
+
+        const int ticks =
+            static_cast<int>(
+                std::lround(
+                    us * 4096 * PWM_HZ / 1e6
+                )
+            );
+
+        const unsigned char b[] = {
+            static_cast<unsigned char>(
+                0x06 + 4 * ch
+            ),
+            0,
+            0,
+            static_cast<unsigned char>(ticks & 255),
+            static_cast<unsigned char>(
+                (ticks >> 8) & 15
+            )
+        };
+
+        dev_.write_bytes(b, 5);
+    }
+
+    void off(int ch) {
+        const unsigned char b[] = {
+            static_cast<unsigned char>(
+                0x06 + 4 * ch
+            ),
+            0,
+            0,
+            0,
+            0x10
+        };
+
+        dev_.write_bytes(b, 5);
+    }
+
+    ~PCA9685() {
+        try {
+            off(PAN_CH);
+            off(TILT_CH);
+        } catch (...) {}
+    }
+};
+
+// Interactive terminal handling
+class Terminal {
+    termios original_{};
+    bool raw_ = false;
+
+public:
+    Terminal() {
+        if (!isatty(STDIN_FILENO) ||
+            tcgetattr(
+                STDIN_FILENO,
+                &original_
+            ) != 0) {
+            throw std::runtime_error(
+                "Interactive terminal or SSH required"
+            );
+        }
+    }
+
+    void raw() {
+        termios mode = original_;
+
+        mode.c_lflag &= ~(ICANON | ECHO);
+        mode.c_cc[VMIN] = 1;
+        mode.c_cc[VTIME] = 0;
+
+        if (tcsetattr(
+            STDIN_FILENO,
+            TCSANOW,
+            &mode
+        ) != 0) {
+            throw std::runtime_error(
+                "Cannot configure terminal"
+            );
+        }
+
+        raw_ = true;
+    }
+
+    void normal() {
+        if (raw_) {
+            tcsetattr(
+                STDIN_FILENO,
+                TCSANOW,
+                &original_
+            );
+        }
+
+        raw_ = false;
+    }
+
+    std::string ask(const std::string& prompt) {
+        normal();
+
+        std::cout << "\n" << prompt << std::flush;
+
+        std::string answer;
+        std::getline(std::cin, answer);
+
+        raw();
+        return answer;
+    }
+
+    ~Terminal() {
+        normal();
+    }
+};
+
+struct Axis {
+    const char* name;
+    int channel;
+
+    std::optional<double> current;
+    std::optional<double> target;
+    std::optional<double> saved;
+
+    int last_ticks = -1;
+};
+
+// Nominal angle conversion
+double degrees(double pulse) {
+    return (
+        pulse - MIN_US
+    ) * 180.0 / (
+        MAX_US - MIN_US
+    );
+}
+
+double pulse_from_deg(double deg) {
+    return MIN_US +
+        deg * (
+            MAX_US - MIN_US
+        ) / 180.0;
+}
+
+int ticks_for(double us) {
+    return static_cast<int>(
+        std::lround(
+            us * 4096 * PWM_HZ / 1e6
+        )
+    );
+}
+
+// Load last commanded positions
+void read_saved(
+    const fs::path& file,
+    Axis& pan,
+    Axis& tilt
+) {
+    std::ifstream f(file);
+
+    std::string name;
+    double pulse;
+
+    while (f >> name >> pulse) {
+        if (!std::isfinite(pulse) ||
+            pulse < MIN_US ||
+            pulse > MAX_US) {
+            continue;
+        }
+
+        if (name == "pan") {
+            pan.saved = pulse;
+        }
+
+        if (name == "tilt") {
+            tilt.saved = pulse;
+        }
+    }
+}
+
+// Save last commanded positions
+void persist(
+    const fs::path& file,
+    Axis& pan,
+    Axis& tilt
+) {
+    fs::create_directories(
+        file.parent_path()
+    );
+
+    const auto tmp = fs::path(
+        file.string() + ".tmp"
+    );
+
+    std::ofstream out(
+        tmp,
+        std::ios::trunc
+    );
+
+    if (!out) {
+        throw std::runtime_error(
+            "Cannot write calibration state"
+        );
+    }
+
+    if (pan.current) {
+        out << "pan " << *pan.current << "\n";
+    } else if (pan.saved) {
+        out << "pan " << *pan.saved << "\n";
+    }
+
+    if (tilt.current) {
+        out << "tilt " << *tilt.current << "\n";
+    } else if (tilt.saved) {
+        out << "tilt " << *tilt.saved << "\n";
+    }
+
+    out.close();
+
+    if (!out) {
+        throw std::runtime_error(
+            "Cannot finish calibration state write"
+        );
+    }
+
+    fs::rename(tmp, file);
+}
+
+// Keyboard reading
+char read_key() {
+    unsigned char key = 0;
+
+    if (::read(
+        STDIN_FILENO,
+        &key,
+        1
+    ) != 1) {
+        return '\0';
+    }
+
+    if (key != 27) {
+        return static_cast<char>(
+            std::tolower(key)
+        );
+    }
+
+    // Arrow-key escape sequence
+    char seq[2] = {};
+
+    for (int i = 0; i < 2; ++i) {
+        fd_set rfds;
+
+        FD_ZERO(&rfds);
+        FD_SET(
+            STDIN_FILENO,
+            &rfds
+        );
+
+        timeval tv{0, 80000};
+
+        if (select(
+            STDIN_FILENO + 1,
+            &rfds,
+            nullptr,
+            nullptr,
+            &tv
+        ) <= 0) {
+            break;
+        }
+
+        if (::read(
+            STDIN_FILENO,
+            &seq[i],
+            1
+        ) != 1) {
+            break;
+        }
+    }
+
+    if (seq[0] != '[') {
+        return '\0';
+    }
+
+    switch (seq[1]) {
+        case 'A': return 'w';
+        case 'B': return 's';
+        case 'C': return 'd';
+        case 'D': return 'a';
+    }
+
+    return '\0';
+}
+
+int main() {
+    std::signal(
+        SIGINT,
+        stop_signal
+    );
+
+    std::signal(
+        SIGTERM,
+        stop_signal
+    );
+
+    const fs::path state =
+        fs::path("runtime") /
+        "servo_last_commands.txt";
+
+    Axis pan{
+        "PAN",
+        PAN_CH,
+        {},
+        {},
+        {},
+        -1
+    };
+
+    Axis tilt{
+        "TILT",
+        TILT_CH,
+        {},
+        {},
+        {},
+        -1
+    };
+
+    try {
+        Terminal keyboard;
+        PCA9685 board;
+
+        read_saved(
+            state,
+            pan,
+            tilt
+        );
+
+        int speed_idx = 1;
+        int step_idx = 1;
+
+        keyboard.raw();
+
+        std::cout
+            << "\nWHISPRYN C++ KEYBOARD CALIBRATION\n"
+            << "PAN ch0 A/D | TILT ch2 W/S | arm 1/2\n"
+            << "Z/X speed | N/M step | P/T exact degrees\n"
+            << "H halt/hold | SPACE PWM off | Q quit\n"
+            << "No auto-start command; no mechanical centre assumed.\n"
+            << "First ARM may still jump if the servo moved unpowered.\n";
+
+        std::cout
+            << "Saved reference: PAN "
+            << (
+                pan.saved
+                ? std::to_string(*pan.saved)
+                : "unknown"
+            )
+            << " us; TILT "
+            << (
+                tilt.saved
+                ? std::to_string(*tilt.saved)
+                : "unknown"
+            )
+            << " us\n";
+
+        auto last_time =
+            std::chrono::steady_clock::now();
+
+        auto last_report = last_time;
+        auto last_save = last_time;
+
+        while (running) {
+            fd_set rfds;
+
+            FD_ZERO(&rfds);
+            FD_SET(
+                STDIN_FILENO,
+                &rfds
+            );
+
+            timeval tv{0, 20000};
+
+            if (select(
+                STDIN_FILENO + 1,
+                &rfds,
+                nullptr,
+                nullptr,
+                &tv
+            ) > 0) {
+
+                const char key = read_key();
+
+                Axis* a =
+                    (
+                        key == '1' ||
+                        key == 'a' ||
+                        key == 'd' ||
+                        key == 'p'
+                    )
+                    ? &pan
+                    : (
+                        key == '2' ||
+                        key == 'w' ||
+                        key == 's' ||
+                        key == 't'
+                    )
+                    ? &tilt
+                    : nullptr;
+
+                if (key == 'q') {
+                    break;
+                }
+
+                if (key == ' ') {
+                    board.off(PAN_CH);
+                    board.off(TILT_CH);
+
+                    if (pan.current) {
+                        pan.saved = pan.current;
+                    }
+
+                    if (tilt.current) {
+                        tilt.saved = tilt.current;
+                    }
+
+                    pan.current.reset();
+                    pan.target.reset();
+                    pan.last_ticks = -1;
+
+                    tilt.current.reset();
+                    tilt.target.reset();
+                    tilt.last_ticks = -1;
+
+                    persist(
+                        state,
+                        pan,
+                        tilt
+                    );
+
+                    std::cout
+                        << "\nPWM OFF: tilt may move under gravity.\n";
+
+                } else if (key == 'h') {
+
+                    if (pan.current) {
+                        pan.target = pan.current;
+                    }
+
+                    if (tilt.current) {
+                        tilt.target = tilt.current;
+                    }
+
+                    std::cout
+                        << "\nTargets halted; holding last commands.\n";
+
+                } else if (key == 'z') {
+
+                    speed_idx = std::max(
+                        0,
+                        speed_idx - 1
+                    );
+
+                } else if (key == 'x') {
+
+                    speed_idx = std::min(
+                        static_cast<int>(speeds.size()) - 1,
+                        speed_idx + 1
+                    );
+
+                } else if (key == 'n') {
+
+                    step_idx = std::max(
+                        0,
+                        step_idx - 1
+                    );
+
+                } else if (key == 'm') {
+
+                    step_idx = std::min(
+                        static_cast<int>(steps.size()) - 1,
+                        step_idx + 1
+                    );
+
+                } else if (
+                    (key == '1' || key == '2') &&
+                    a
+                ) {
+
+                    if (a->current) {
+                        std::cout
+                            << "\n"
+                            << a->name
+                            << " already armed.\n";
+                    } else {
+
+                        keyboard.normal();
+
+                        std::cout
+                            << "\nLast saved "
+                            << a->name
+                            << ": "
+                            << (
+                                a->saved
+                                ? std::to_string(*a->saved) + " us"
+                                : "unknown"
+                            )
+                            << "\n";
+
+                        std::cout
+                            << "Servo may have moved while off. "
+                            << "Enter INITIAL pulse "
+                            << "(1000..2000 us, blank cancels): "
+                            << std::flush;
+
+                        std::string input;
+                        std::getline(
+                            std::cin,
+                            input
+                        );
+
+                        if (!input.empty()) {
+                            try {
+                                size_t used = 0;
+
+                                const double pulse =
+                                    std::stod(input, &used);
+
+                                if (
+                                    used != input.size() ||
+                                    !std::isfinite(pulse) ||
+                                    pulse < MIN_US ||
+                                    pulse > MAX_US
+                                ) {
+                                    throw std::invalid_argument(
+                                        "pulse"
+                                    );
+                                }
+
+                                std::cout
+                                    << "Type ARM to send this first command "
+                                    << "(may jump): "
+                                    << std::flush;
+
+                                std::string confirmation;
+
+                                std::getline(
+                                    std::cin,
+                                    confirmation
+                                );
+
+                                if (confirmation == "ARM") {
+                                    board.pulse(
+                                        a->channel,
+                                        pulse
+                                    );
+
+                                    a->current = pulse;
+                                    a->target = pulse;
+                                    a->last_ticks =
+                                        ticks_for(pulse);
+
+                                    persist(
+                                        state,
+                                        pan,
+                                        tilt
+                                    );
+
+                                    std::cout
+                                        << a->name
+                                        << " ARMED at "
+                                        << pulse
+                                        << " us\n";
+                                } else {
+                                    std::cout
+                                        << "Cancelled.\n";
+                                }
+
+                            } catch (...) {
+                                std::cout
+                                    << "Invalid initial pulse.\n";
+                            }
+                        }
+
+                        keyboard.raw();
+
+                        last_time =
+                            std::chrono::steady_clock::now();
+                    }
+
+                } else if (
+                    (key == 'p' || key == 't') &&
+                    a
+                ) {
+
+                    if (!a->current) {
+                        std::cout
+                            << "\nArm "
+                            << a->name
+                            << " first.\n";
+                    } else {
+                        keyboard.normal();
+
+                        std::cout
+                            << "\n"
+                            << a->name
+                            << " nominal target degrees "
+                            << "(0..180, blank cancels): "
+                            << std::flush;
+
+                        std::string input;
+                        std::getline(
+                            std::cin,
+                            input
+                        );
+
+                        if (!input.empty()) {
+                            try {
+                                size_t used = 0;
+
+                                const double angle =
+                                    std::stod(input, &used);
+
+                                if (
+                                    used != input.size() ||
+                                    !std::isfinite(angle) ||
+                                    angle < 0 ||
+                                    angle > 180
+                                ) {
+                                    throw std::invalid_argument(
+                                        "angle"
+                                    );
+                                }
+
+                                if (
+                                    std::abs(
+                                        angle -
+                                        degrees(*a->current)
+                                    ) > 20
+                                ) {
+                                    std::cout
+                                        << "Large change. "
+                                        << "Type YES to proceed: "
+                                        << std::flush;
+
+                                    std::string confirm;
+                                    std::getline(
+                                        std::cin,
+                                        confirm
+                                    );
+
+                                    if (confirm != "YES") {
+                                        throw std::invalid_argument(
+                                            "cancelled"
+                                        );
+                                    }
+                                }
+
+                                a->target =
+                                    pulse_from_deg(angle);
+
+                            } catch (...) {
+                                std::cout
+                                    << "Target cancelled or invalid.\n";
+                            }
+                        }
+
+                        keyboard.raw();
+
+                        last_time =
+                            std::chrono::steady_clock::now();
+                    }
+
+                } else if (
+                    a &&
+                    (
+                        key == 'a' ||
+                        key == 'd' ||
+                        key == 'w' ||
+                        key == 's'
+                    )
+                ) {
+
+                    if (!a->target) {
+                        std::cout
+                            << "\nArm "
+                            << a->name
+                            << " first.\n";
+                    } else {
+
+                        const int sign =
+                            (
+                                key == 'd' ||
+                                key == 'w'
+                            ) ? 1 : -1;
+
+                        a->target = std::clamp(
+                            *a->target +
+                            sign * (
+                                pulse_from_deg(
+                                    steps[step_idx]
+                                ) - MIN_US
+                            ),
+                            MIN_US,
+                            MAX_US
+                        );
+                    }
+                }
+            }
+
+            const auto now =
+                std::chrono::steady_clock::now();
+
+            const double dt = std::clamp(
+                std::chrono::duration<double>(
+                    now - last_time
+                ).count(),
+                0.0,
+                0.1
+            );
+
+            last_time = now;
+
+            const double us_per_second =
+                speeds[speed_idx] *
+                (MAX_US - MIN_US) / 180.0;
+
+            for (auto* a : {&pan, &tilt}) {
+                if (!a->current || !a->target) {
+                    continue;
+                }
+
+                const double remaining =
+                    *a->target - *a->current;
+
+                if (std::abs(remaining) < 0.0001) {
+                    continue;
+                }
+
+                *a->current += std::copysign(
+                    std::min(
+                        std::abs(remaining),
+                        us_per_second * dt
+                    ),
+                    remaining
+                );
+
+                const int ticks =
+                    ticks_for(*a->current);
+
+                if (ticks != a->last_ticks) {
+                    board.pulse(
+                        a->channel,
+                        *a->current
+                    );
+
+                    a->last_ticks = ticks;
+                }
+            }
+
+            if (
+                now - last_report >
+                std::chrono::milliseconds(500)
+            ) {
+                auto show = [](const Axis& a) {
+                    if (!a.current) {
+                        return std::string("OFF");
+                    }
+
+                    return std::to_string(
+                        static_cast<int>(
+                            std::lround(
+                                degrees(*a.current)
+                            )
+                        )
+                    ) + "deg* / " +
+                    std::to_string(
+                        static_cast<int>(
+                            std::lround(*a.current)
+                        )
+                    ) + "us";
+                };
+
+                std::cout
+                    << "\rPAN " << show(pan)
+                    << " | TILT " << show(tilt)
+                    << " | speed "
+                    << speeds[speed_idx]
+                    << "deg/s | step "
+                    << steps[step_idx]
+                    << "deg       "
+                    << std::flush;
+
+                last_report = now;
+            }
+
+            if (
+                now - last_save >
+                std::chrono::seconds(2)
+            ) {
+                try {
+                    persist(
+                        state,
+                        pan,
+                        tilt
+                    );
+                } catch (...) {}
+
+                last_save = now;
+            }
+        }
+
+        persist(
+            state,
+            pan,
+            tilt
+        );
+
+        keyboard.normal();
+
+        std::cout
+            << "\nStopped. Servo outputs disabled.\n";
+
+    } catch (const std::exception& e) {
+        std::cerr
+            << "\nERROR: "
+            << e.what()
+            << "\n";
+
+        return 1;
+    }
+
+    return 0;
+}
