@@ -259,8 +259,23 @@ def install(demo, offline):
         f'<button type="button" disabled value="{x}">Test {x}</button>'
         for x in LABELS
     )
-    panel = PANEL.replace('OFFLINE_TABLE', table(offline)).replace('TRIAL_BUTTONS', buttons)
-    demo.HOME = demo.HOME.replace('</main>', panel + '</main>', 1)
+    # Load the three views and insert the real benchmark and trial buttons.
+    layout_path = Path(__file__).with_name("dashboard_pages.html")
+    layout = layout_path.read_text(encoding="utf-8")
+    layout = layout.replace("OFFLINE_TABLE", table(offline))
+    layout = layout.replace("TRIAL_BUTTONS", buttons)
+
+    # Keep the original header, Listening indicator, and live-update JavaScript.
+    header, opening, rest = demo.HOME.partition("<main>")
+    _, closing, tail = rest.partition("</main>")
+    if not opening or not closing:
+        raise ValueError("Could not find <main> in live_demo.py")
+
+    # Reuse the tested trial-button and metrics-refresh code, not the old panel.
+    _, script_tag, trial_script = PANEL.partition("<script>")
+    if not script_tag:
+        raise ValueError("Could not find the existing live-trial script")
+    demo.HOME = header + opening + layout + closing + script_tag + trial_script + tail
     demo.Dashboard, demo.set_state = Handler, on_prediction
 
 

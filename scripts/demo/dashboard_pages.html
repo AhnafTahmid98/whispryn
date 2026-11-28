@@ -1,0 +1,149 @@
+<style>
+  .labnav {
+    display:flex; flex-wrap:wrap; gap:6px;
+    padding-bottom:10px; border-bottom:1px solid #dce3ec;
+  }
+  .labnav a {
+    padding:9px 15px; border-radius:8px;
+    color:#334861; text-decoration:none; font-weight:650;
+  }
+  .labnav a[aria-current="page"] {background:#153f83; color:white}
+  .labnav a:focus-visible, #rf-buttons button:focus-visible {
+    outline:3px solid #3988d1; outline-offset:2px;
+  }
+
+  [data-view][hidden] {display:none!important}
+  [data-view] h2 {margin:24px 0 6px; font-size:28px}
+  .intro {margin:0 0 18px; color:#50647b}
+  .pair {
+    display:grid; grid-template-columns:repeat(2,minmax(0,1fr));
+    gap:16px; margin:16px 0; align-items:stretch;
+  }
+  .pair .card {min-width:0; margin:0}
+  .model h3 {margin:0 0 5px}
+  .result {font-size:28px; font-weight:750; margin:8px 0 16px; color:#163557}
+  .model small, .systemline {color:#50647b}
+  .systemline {line-height:1.8; overflow-wrap:anywhere}
+
+  .evalcard {overflow-x:auto; max-width:960px}
+  .evalcard table {
+    border-collapse:collapse; width:100%; margin:14px 0;
+    font-variant-numeric:tabular-nums;
+  }
+  .evalcard th, .evalcard td {
+    text-align:right; padding:9px; border-bottom:1px solid #dce3ec;
+  }
+  .evalcard tr > :first-child {text-align:left}
+  .evalcard summary {cursor:pointer; font-weight:650}
+  #rf-buttons {display:flex; flex-wrap:wrap; gap:8px}
+  #rf-buttons button {
+    background:#eff4fb; color:#153f83; border:1px solid #acbfd8;
+    border-radius:8px; padding:9px 14px; cursor:pointer;
+  }
+  #rf-buttons button:disabled {opacity:.5; cursor:default}
+
+  /* On a phone, stack the cards instead of squeezing the labels. */
+  @media(max-width:760px) {.pair {grid-template-columns:1fr}}
+</style>
+
+<nav class="labnav" aria-label="Dashboard views">
+  <a href="#monitor">Live monitor</a>
+  <a href="#trials">Live trials</a>
+  <a href="#benchmark">Benchmark</a>
+</nav>
+
+<!-- Microphone or model errors should be visible on every tab. -->
+<div id="message" role="alert"></div>
+
+<section data-view="monitor">
+  <h2>Live monitor</h2>
+  <p class="intro">One microphone. Two models listening to the same room.</p>
+
+  <div class="pair">
+    <article class="card model">
+      <h3>Google YAMNet</h3>
+      <small>Pretrained · general sound categories</small>
+      <div class="result" id="topEvent">—</div>
+      <div id="googleBars"></div>
+      <p class="below">
+        Selected scores: clapping, whistling and speech.
+        Speech does not identify the word “hey”.
+      </p>
+      <small>Inference: <b id="latency">—</b> ms</small>
+    </article>
+
+    <article class="card model">
+      <h3>Whispryn Random Forest v2</h3>
+      <small>Team-trained · four project classes</small>
+      <div class="result" id="rfEvent">—</div>
+      <div id="rfBars"></div>
+      <p class="below">
+        Prediction from a rolling 3-second window.
+        These scores are not measured accuracy.
+      </p>
+      <small>Features + prediction: <b id="rfMs">—</b></small>
+    </article>
+  </div>
+
+  <div class="pair">
+    <article class="card">
+      <h3>YAMNet score history · ~40 s</h3>
+      <canvas id="graph"></canvas>
+      <div class="legend">
+        <span>🔵 Clapping</span>
+        <span>🟢 Whistling</span>
+        <span>🟠 Speech</span>
+      </div>
+    </article>
+
+    <article class="card">
+      <h3>Camera preview · <small id="cameraStatus">Connecting…</small></h3>
+      <img class="camera-preview" src="/camera.mjpg" alt="Live Raspberry Pi camera">
+    </article>
+  </div>
+
+  <p class="systemline">
+    Microphone: <b id="device">—</b> · Audio level (RMS): <b id="rms">—</b> · 16 kHz
+  </p>
+</section>
+
+<section data-view="trials" hidden>
+  <h2>Live trials</h2>
+  <p class="intro">Choose the actual sound, wait for the cue, then make it once.</p>
+  <div class="card evalcard">
+    <div id="rf-buttons">TRIAL_BUTTONS</div>
+    <p id="rf-msg" role="status">Connecting…</p>
+    <div id="rf-results"></div>
+    <small id="rf-note"></small>
+  </div>
+</section>
+
+<section data-view="benchmark" hidden>
+  <h2>Offline benchmark</h2>
+  <p class="intro">
+    Random Forest v2 · saved, labeled recordings.
+    Live trials do not change these results.
+  </p>
+  <div class="card evalcard">OFFLINE_TABLE</div>
+</section>
+
+<script>
+(() => {
+  const views = [...document.querySelectorAll('[data-view]')];
+  const links = [...document.querySelectorAll('.labnav a')];
+
+  function show() {
+    const hash = location.hash.slice(1);
+    const name = views.some(v => v.dataset.view === hash) ? hash : 'monitor';
+
+    views.forEach(v => v.hidden = v.dataset.view !== name);
+    links.forEach(a => {
+      if (a.hash === '#' + name) a.setAttribute('aria-current', 'page');
+      else a.removeAttribute('aria-current');
+    });
+  }
+
+  window.addEventListener('hashchange', show);
+  show();
+})();
+</script>
