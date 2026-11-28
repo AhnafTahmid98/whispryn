@@ -12,6 +12,7 @@
 #include <cmath>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <optional>
 #include <stdexcept>
@@ -32,8 +33,8 @@ constexpr int PWM_HZ = 50;
 constexpr double MIN_US = 1000;
 constexpr double MAX_US = 2000;
 
-const std::array<double, 8> speeds{
-    3, 5, 10, 20, 30, 40, 60, 80
+const std::array<double, 11> speeds{
+    3, 5, 10, 20, 30, 40, 60, 80, 100, 150, 200
 };
 
 const std::array<double, 4> steps{
@@ -262,6 +263,21 @@ public:
     }
 };
 
+struct Marks {
+    std::optional<double> center, low, high;
+
+    double minimum() const { return low.value_or(MIN_US); }
+    double maximum() const { return high.value_or(MAX_US); }
+
+    bool valid() const {
+        for (auto pulse : {center, low, high}) {
+            if (pulse && !(*pulse >= MIN_US && *pulse <= MAX_US)) return false;
+        }
+        return (!low || (center && *low < *center)) &&
+               (!high || (center && *center < *high));
+    }
+};
+
 struct Axis {
     const char* name;
     int channel;
@@ -271,6 +287,7 @@ struct Axis {
     std::optional<double> saved;
 
     int last_ticks = -1;
+    Marks marks{};
 };
 
 // Nominal angle conversion
@@ -287,6 +304,47 @@ double pulse_from_deg(double deg) {
         deg * (
             MAX_US - MIN_US
         ) / 180.0;
+}
+
+double displayed_degrees(const Axis& axis, double pulse) {
+    return degrees(pulse) - degrees(axis.marks.center.value_or(MIN_US));
+}
+
+// Store calibration separately from the last position commanded before PWM was disabled.
+void read_marks(const fs::path& file, Axis& pan, Axis& tilt) {
+    if (!fs::exists(file)) return;
+    std::ifstream in(file);
+    if (!in) throw std::runtime_error("Cannot read " + file.string());
+    std::string axis_name, key;
+    double pulse;
+    while (in >> axis_name) {
+        if (!(in >> key >> pulse)) throw std::runtime_error("Incomplete servo mark");
+        Axis* axis = axis_name == pan.name ? &pan : axis_name == tilt.name ? &tilt : nullptr;
+        if (!axis) throw std::runtime_error("Unknown axis in servo marks");
+        auto& marks = axis->marks;
+        if (key == "center" && !marks.center) marks.center = pulse;
+        else if (key == "low" && !marks.low) marks.low = pulse;
+        else if (key == "high" && !marks.high) marks.high = pulse;
+        else throw std::runtime_error("Unknown or duplicate servo mark");
+    }
+    if (!in.eof() || !pan.marks.valid() || !tilt.marks.valid())
+        throw std::runtime_error("Invalid servo marks in " + file.string());
+}
+
+void save_marks(const fs::path& file, const Axis& pan, const Axis& tilt) {
+    fs::create_directories(file.parent_path());
+    const fs::path tmp = file.string() + ".tmp";
+    std::ofstream out(tmp);
+    out << std::setprecision(17);
+    for (const Axis* axis : {&pan, &tilt}) {
+        const auto& m = axis->marks;
+        if (m.center) out << axis->name << " center " << *m.center << '\n';
+        if (m.low) out << axis->name << " low " << *m.low << '\n';
+        if (m.high) out << axis->name << " high " << *m.high << '\n';
+    }
+    out.close();
+    if (!out) throw std::runtime_error("Cannot write " + tmp.string());
+    fs::rename(tmp, file);
 }
 
 int ticks_for(double us) {
@@ -452,6 +510,7 @@ int main() {
     const fs::path state =
         fs::path("runtime") /
         "servo_last_commands.txt";
+    const fs::path marks_file = state.parent_path() / "servo_marks.txt";
 
     Axis pan{
         "PAN",
@@ -473,6 +532,7 @@ int main() {
 
     try {
         Terminal keyboard;
+        read_marks(marks_file, pan, tilt);
         PCA9685 board;
 
         read_saved(
@@ -482,14 +542,17 @@ int main() {
         );
 
         int speed_idx = 1;
-        int step_idx = 1;
+        int step_idx = 0;
+        Axis* selected = &pan;
 
         keyboard.raw();
 
         std::cout
             << "\nWHISPRYN C++ KEYBOARD CALIBRATION\n"
             << "PAN ch0 A/D | TILT ch2 W/S | arm 1/2\n"
-            << "Z/X speed | N/M step | P/T exact degrees\n"
+            << "Z/X speed | N/M step | P/T exact degrees (relative after marking center)\n"
+            << "1/2 or jog selects axis | C mark center | 0 return to center\n"
+            << "[ mark lower limit | ] mark upper limit | R reset selected axis marks\n"
             << "H halt/hold | SPACE PWM off | Q quit\n"
             << "No auto-start command; no mechanical centre assumed.\n"
             << "First ARM may still jump if the servo moved unpowered.\n";
@@ -552,6 +615,7 @@ int main() {
                     )
                     ? &tilt
                     : nullptr;
+                if (a) selected = a;
 
                 if (key == 'q') {
                     break;
@@ -586,6 +650,37 @@ int main() {
                     std::cout
                         << "\nPWM OFF: tilt may move under gravity.\n";
 
+                } else if (key == 'c' || key == '[' || key == ']' || key == '0' || key == 'r') {
+                    Axis& axis = *selected;
+                    if (key == 'r') {
+                        axis.target = axis.current;
+                        if (keyboard.ask(std::string("Type RESET to clear ") + axis.name + " marks: ") == "RESET") {
+                            axis.marks = {};
+                            save_marks(marks_file, pan, tilt);
+                            std::cout << "\n" << axis.name << " marks cleared.\n";
+                        }
+                        last_time = std::chrono::steady_clock::now();
+                    } else if (!axis.current) {
+                        std::cout << "\nArm " << axis.name << " first.\n";
+                    } else if (key == '0') {
+                        if (axis.marks.center) axis.target = axis.marks.center;
+                        else std::cout << "\nJog to center and press C first.\n";
+                    } else {
+                        axis.target = axis.current;
+                        Marks marks = axis.marks;
+                        if (key == 'c') marks.center = axis.current;
+                        if (key == '[') marks.low = axis.current;
+                        if (key == ']') marks.high = axis.current;
+                        if (marks.valid()) {
+                            axis.marks = marks;
+                            save_marks(marks_file, pan, tilt);
+                            const char* label = key == 'c' ? "center" : key == '[' ? "lower limit" : "upper limit";
+                            std::cout << "\n" << axis.name << " " << label << " saved at "
+                                      << *axis.current << " us.\n";
+                        } else {
+                            std::cout << "\nSet center first and keep lower < center < upper.\n";
+                        }
+                    }
                 } else if (key == 'h') {
 
                     if (pan.current) {
@@ -655,7 +750,8 @@ int main() {
                         std::cout
                             << "Servo may have moved while off. "
                             << "Enter INITIAL pulse "
-                            << "(1000..2000 us, blank cancels): "
+                            << "(" << a->marks.minimum() << ".." << a->marks.maximum()
+                            << " us, blank cancels): "
                             << std::flush;
 
                         std::string input;
@@ -674,8 +770,8 @@ int main() {
                                 if (
                                     used != input.size() ||
                                     !std::isfinite(pulse) ||
-                                    pulse < MIN_US ||
-                                    pulse > MAX_US
+                                    pulse < a->marks.minimum() ||
+                                    pulse > a->marks.maximum()
                                 ) {
                                     throw std::invalid_argument(
                                         "pulse"
@@ -749,8 +845,9 @@ int main() {
                         std::cout
                             << "\n"
                             << a->name
-                            << " nominal target degrees "
-                            << "(0..180, blank cancels): "
+                            << (a->marks.center ? " degrees from center " : " nominal target degrees ")
+                            << "(" << displayed_degrees(*a, a->marks.minimum()) << ".."
+                            << displayed_degrees(*a, a->marks.maximum()) << ", blank cancels): "
                             << std::flush;
 
                         std::string input;
@@ -765,12 +862,14 @@ int main() {
 
                                 const double angle =
                                     std::stod(input, &used);
+                                const double target = a->marks.center.value_or(MIN_US) +
+                                    angle * (MAX_US - MIN_US) / 180.0;
 
                                 if (
                                     used != input.size() ||
                                     !std::isfinite(angle) ||
-                                    angle < 0 ||
-                                    angle > 180
+                                    target < a->marks.minimum() ||
+                                    target > a->marks.maximum()
                                 ) {
                                     throw std::invalid_argument(
                                         "angle"
@@ -780,7 +879,7 @@ int main() {
                                 if (
                                     std::abs(
                                         angle -
-                                        degrees(*a->current)
+                                        displayed_degrees(*a, *a->current)
                                     ) > 20
                                 ) {
                                     std::cout
@@ -801,8 +900,7 @@ int main() {
                                     }
                                 }
 
-                                a->target =
-                                    pulse_from_deg(angle);
+                                a->target = target;
 
                             } catch (...) {
                                 std::cout
@@ -840,14 +938,14 @@ int main() {
                             ) ? 1 : -1;
 
                         a->target = std::clamp(
-                            *a->target +
+                            *a->current +
                             sign * (
                                 pulse_from_deg(
                                     steps[step_idx]
                                 ) - MIN_US
                             ),
-                            MIN_US,
-                            MAX_US
+                            a->marks.minimum(),
+                            a->marks.maximum()
                         );
                     }
                 }
@@ -915,7 +1013,7 @@ int main() {
                     return std::to_string(
                         static_cast<int>(
                             std::lround(
-                                degrees(*a.current)
+                                displayed_degrees(a, *a.current)
                             )
                         )
                     ) + "deg* / " +
@@ -929,6 +1027,7 @@ int main() {
                 std::cout
                     << "\rPAN " << show(pan)
                     << " | TILT " << show(tilt)
+                    << " | selected " << selected->name
                     << " | speed "
                     << speeds[speed_idx]
                     << "deg/s | step "
