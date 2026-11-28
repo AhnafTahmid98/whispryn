@@ -28,6 +28,7 @@ namespace fs = std::filesystem;
 constexpr int PCA_ADDR = 0x40;
 constexpr int PAN_CH = 0;
 constexpr int TILT_CH = 2;
+constexpr int FIXED_TILT_US = 2583;
 constexpr int PWM_HZ = 50;
 
 // PWM signal test range. The mounted mechanism has its own travel limits.
@@ -295,6 +296,7 @@ struct Axis {
 std::string show_axis(const Axis& axis) {
     if (!axis.current) return "OFF";
     std::string pulse = std::to_string(std::lround(*axis.current)) + "us";
+    if (axis.channel == TILT_CH) return pulse + " (fixed)";
     if (!axis.marks.center) return pulse + " (center unset)";
     const auto offset = std::lround(*axis.current - *axis.marks.center);
     return pulse + " (" + (offset > 0 ? "+" : "") + std::to_string(offset) + "us from center)";
@@ -343,6 +345,13 @@ int ticks_for(double us) {
             us * 4096 * PWM_HZ / 1e6
         )
     );
+}
+
+void enable_axis(PCA9685& board, Axis& axis, double pulse) {
+    board.pulse(axis.channel, pulse);
+    axis.current = pulse;
+    axis.target = pulse;
+    axis.last_ticks = ticks_for(pulse);
 }
 
 // Load last commanded positions
@@ -539,9 +548,9 @@ int main() {
 
         std::cout
             << "\nWHISPRYN C++ KEYBOARD CALIBRATION\n"
-            << "PAN ch0 A/D | TILT ch2 W/up (-us), S/down (+us) | arm 1/2\n"
-            << "Z/X pulse speed (us/s) | N/M pulse step (us) | P/T pulse offset from center (us)\n"
-            << "1/2 or jog selects axis | C mark center | 0 return to center\n"
+            << "1 arm PAN (ch0), A/D jog | 2 arm fixed TILT (ch2) at " << FIXED_TILT_US << " us\n"
+            << "PAN: Z/X pulse speed (us/s) | N/M pulse step (us) | P pulse offset from center (us)\n"
+            << "PAN: C mark center | 0 return to center\n"
             << "[ mark lower limit | ] mark upper limit | R reset selected axis marks\n"
             << "H halt/hold | SPACE PWM off | Q quit\n"
             << "No auto-start command; no mechanical centre assumed.\n"
@@ -643,7 +652,9 @@ int main() {
 
                 } else if (key == 'c' || key == '[' || key == ']' || key == '0' || key == 'r') {
                     Axis& axis = *selected;
-                    if (key == 'r') {
+                    if (selected == &tilt && key != 'r') {
+                        std::cout << "\nTILT is fixed at " << FIXED_TILT_US << " us.\n";
+                    } else if (key == 'r') {
                         axis.target = axis.current;
                         if (keyboard.ask(std::string("Type RESET to clear ") + axis.name + " marks: ") == "RESET") {
                             axis.marks = {};
@@ -713,10 +724,26 @@ int main() {
                         step_idx + 1
                     );
 
-                } else if (
-                    (key == '1' || key == '2') &&
-                    a
-                ) {
+                } else if (key == '2') {
+                    if (tilt.current) {
+                        std::cout << "\nTILT already holding " << FIXED_TILT_US << " us.\n";
+                    } else if (FIXED_TILT_US < tilt.marks.minimum() || FIXED_TILT_US > tilt.marks.maximum()) {
+                        std::cout << "\nFixed TILT pulse is outside saved limits. TILT stays off.\n";
+                    } else {
+                        const std::string prompt = "Type ARM to hold TILT at " +
+                            std::to_string(FIXED_TILT_US) + " us (first move may jump): ";
+                        if (keyboard.ask(prompt) == "ARM" && running) {
+                            enable_axis(board, tilt, FIXED_TILT_US);
+                            persist(state, pan, tilt);
+                            std::cout << "\nTILT holding " << FIXED_TILT_US << " us.\n";
+                        } else {
+                            std::cout << "\nCancelled.\n";
+                        }
+                        last_time = std::chrono::steady_clock::now();
+                    }
+                } else if (key == 'w' || key == 's' || key == 't') {
+                    std::cout << "\nTILT is fixed at " << FIXED_TILT_US << " us.\n";
+                } else if (key == '1' && a) {
 
                     if (a->current) {
                         std::cout
@@ -782,15 +809,7 @@ int main() {
                                 );
 
                                 if (confirmation == "ARM") {
-                                    board.pulse(
-                                        a->channel,
-                                        pulse
-                                    );
-
-                                    a->current = pulse;
-                                    a->target = pulse;
-                                    a->last_ticks =
-                                        ticks_for(pulse);
+                                    enable_axis(board, *a, pulse);
 
                                     persist(
                                         state,
@@ -820,10 +839,7 @@ int main() {
                             std::chrono::steady_clock::now();
                     }
 
-                } else if (
-                    (key == 'p' || key == 't') &&
-                    a
-                ) {
+                } else if (key == 'p' && a) {
 
                     if (!a->current) {
                         std::cout
@@ -903,15 +919,7 @@ int main() {
                             std::chrono::steady_clock::now();
                     }
 
-                } else if (
-                    a &&
-                    (
-                        key == 'a' ||
-                        key == 'd' ||
-                        key == 'w' ||
-                        key == 's'
-                    )
-                ) {
+                } else if (a && (key == 'a' || key == 'd')) {
 
                     if (!a->target) {
                         std::cout
@@ -920,8 +928,7 @@ int main() {
                             << " first.\n";
                     } else {
 
-                        // On this mount a shorter tilt pulse moves the camera up.
-                        const int sign = (key == 'd' || key == 's') ? 1 : -1;
+                        const int sign = key == 'd' ? 1 : -1;
 
                         a->target = std::clamp(
                             *a->current +
