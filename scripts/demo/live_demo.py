@@ -22,6 +22,8 @@ import numpy as np
 
 from ai_edge_litert.interpreter import Interpreter
 
+from camera_feed import CameraFeed
+
 
 # -----------------------------------------
 # 1. SETTINGS
@@ -65,6 +67,10 @@ state = {
 
 lock = threading.Lock()
 stop = threading.Event()
+camera = CameraFeed(
+    stop,
+    ROOT / "runtime/logs/camera.log"
+)
 recorder = None
 
 
@@ -577,6 +583,15 @@ canvas {
     height: 285px;
 }
 
+.camera-preview {
+    display: block;
+    width: 100%;
+    aspect-ratio: 16 / 9;
+    object-fit: contain;
+    background: #101827;
+    border-radius: 12px;
+}
+
 .legend {
     display: flex;
     gap: 18px;
@@ -814,6 +829,27 @@ footer {
 <section class="layout">
 
     <div class="left">
+
+        <div class="card">
+            <div class="card-header">
+                <h3>Live Camera</h3>
+
+                <span class="small-tag" id="cameraStatus">
+                    Connecting...
+                </span>
+            </div>
+
+            <img
+                class="camera-preview"
+                src="/camera.mjpg"
+                alt="WHISPRYN live Raspberry Pi camera"
+            >
+
+            <div class="below">
+                Camera Module 2 NoIR · 640 × 360 · 10 FPS
+                · Live preview only
+            </div>
+        </div>
 
         <div class="card">
 
@@ -1102,6 +1138,9 @@ async function update() {
 
         const s = await response.json();
 
+        document.getElementById("cameraStatus").textContent =
+            s.camera_status || "Unavailable";
+
         document.getElementById("statusText").textContent =
             s.status;
 
@@ -1196,8 +1235,15 @@ class Dashboard(BaseHTTPRequestHandler):
             with lock:
                 snapshot = dict(state)
 
+            with camera.lock:
+                snapshot["camera_status"] = camera.status
+
             content = json.dumps(snapshot).encode("utf-8")
             content_type = "application/json; charset=utf-8"
+
+        elif self.path == "/camera.mjpg":
+            camera.stream(self)
+            return
 
         else:
             self.send_error(404)
@@ -1232,6 +1278,8 @@ class Dashboard(BaseHTTPRequestHandler):
 # -----------------------------------------
 
 def main():
+
+    camera.start()
 
     thread = threading.Thread(
         target=listen,
@@ -1273,6 +1321,7 @@ def main():
     finally:
 
         stop.set()
+        camera.close()
 
         if recorder is not None:
             if recorder.poll() is None:
