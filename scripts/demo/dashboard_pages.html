@@ -48,6 +48,7 @@
 
 <nav class="labnav" aria-label="Dashboard views">
   <a href="#monitor">Live monitor</a>
+  <a href="#compare">Compare models</a>
   <a href="#trials">Live trials</a>
   <a href="#benchmark">Benchmark</a>
 </nav>
@@ -97,6 +98,13 @@
     </article>
 
     <article class="card">
+      <h3>Random Forest score history · ~40 s</h3>
+      <canvas id="rfGraph" aria-label="Live scores for all four Random Forest classes"></canvas>
+      <div class="legend">⚪ Background · 🔵 Clap · 🟣 Hey · 🟢 Whistle</div>
+    </article>
+  </div>
+  <div style="max-width:740px;margin:16px 0">
+    <article class="card">
       <h3>Camera preview · <small id="cameraStatus">Connecting…</small></h3>
       <img class="camera-preview" src="/camera.mjpg" alt="Live Raspberry Pi camera">
     </article>
@@ -105,6 +113,40 @@
   <p class="systemline">
     Microphone: <b id="device">—</b> · Audio level (RMS): <b id="rms">—</b> · 16 kHz
   </p>
+</section>
+
+<section data-view="compare" hidden>
+  <h2>Compare models</h2>
+  <p class="intro">
+    Same microphone update, different model windows. Scores are not accuracy.
+  </p>
+
+  <label>Compare this sound:
+    <select id="compareSound">
+      <option value="clap">Clap</option>
+      <option value="whistle">Whistle</option>
+    </select>
+  </label>
+
+  <div class="pair">
+    <article class="card">
+      <h3>Google YAMNet</h3>
+      <div class="result" id="pairY">—</div>
+    </article>
+    <article class="card">
+      <h3>Whispryn Random Forest v2</h3>
+      <div class="result" id="pairR">—</div>
+    </article>
+  </div>
+
+  <article class="card">
+    <h3>Live score history · earlier → latest</h3>
+    <canvas id="pairGraph" aria-label="Two models' scores for the selected sound"></canvas>
+    <div class="legend">🔵 Google YAMNet · 🟣 Whispryn Random Forest</div>
+    <p class="below">
+      Latest 80 paired updates. Speech is not the same label as “hey”.
+    </p>
+  </article>
 </section>
 
 <section data-view="trials" hidden>

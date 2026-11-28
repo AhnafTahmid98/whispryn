@@ -218,6 +218,7 @@ def listen():
             )
 
             history = deque(maxlen=80)
+            paired = deque(maxlen=80)
 
             while not stop.is_set():
 
@@ -328,6 +329,9 @@ def listen():
                         time.perf_counter() - started
                     ) * 1000
 
+                if rf_name in RF_CLASSES:
+                    paired.append([google_scores, rf_scores])
+
                 # Update the dashboard.
                 set_state(
                     status="Listening",
@@ -337,6 +341,7 @@ def listen():
                     rf=rf_scores,
                     rf_name=rf_name,
                     history=list(history),
+                    paired=list(paired),
                     rms=volume,
                     yamnet_ms=yamnet_ms,
                     rf_ms=rf_ms,
@@ -1046,9 +1051,10 @@ function showBars(id, names, scores, colors) {
 
 
 // Draw the live sound graph
-function drawGraph(history) {
+function drawGraph(history, id="graph", colors=googleColors) {
 
-    const canvas = document.getElementById("graph");
+    const canvas = document.getElementById(id);
+    if (!canvas || !canvas.clientWidth) return;
 
     const w = canvas.getBoundingClientRect().width || 650;
     const h = 285;
@@ -1089,7 +1095,7 @@ function drawGraph(history) {
     }
 
     // Draw three model-score lines
-    googleColors.forEach((color, channel) => {
+    colors.forEach((color, channel) => {
 
         ctx.strokeStyle = color;
         ctx.lineWidth = 2.5;
@@ -1188,6 +1194,34 @@ async function update() {
         );
 
         drawGraph(s.history);
+
+        const frames = s.status === "Listening" ? (s.paired || []) : [];
+        const latest = frames[frames.length - 1];
+        const predicted = rfNames.indexOf(s.rf_name);
+
+        if (latest && predicted >= 0) {
+            document.getElementById("rfEvent").textContent =
+                s.rf_name + " · " + latest[1][predicted].toFixed(3);
+        }
+
+        drawGraph(frames.map(f => f[1]), "rfGraph", rfColors);
+
+        const selector = document.getElementById("compareSound");
+        if (selector) {
+            const clap = selector.value === "clap";
+            const yi = googleNames.indexOf(clap ? "Clapping" : "Whistling");
+            const ri = rfNames.indexOf(clap ? "clap" : "whistle");
+
+            const lines = frames.map(([yam, rf]) => [yam[yi], rf[ri]]);
+            const current = lines[lines.length - 1];
+
+            document.getElementById("pairY").textContent =
+                current ? current[0].toFixed(3) : "—";
+            document.getElementById("pairR").textContent =
+                current ? current[1].toFixed(3) : "—";
+
+            drawGraph(lines, "pairGraph", ["#2777df", "#9165cf"]);
+        }
 
     } catch (error) {
 
