@@ -33,6 +33,8 @@ constexpr int PWM_HZ = 50;
 // Electrical safeguards, NOT mechanical limits
 constexpr double MIN_US = 1000;
 constexpr double MAX_US = 2000;
+// Scale for keyboard commands only. The servo does not report shaft angles.
+constexpr double US_PER_NOMINAL_DEG = (MAX_US - MIN_US) / 180.0;
 
 const std::array<double, 11> speeds{
     3, 5, 10, 20, 30, 40, 60, 80, 100, 150, 200
@@ -291,24 +293,12 @@ struct Axis {
     Marks marks{};
 };
 
-// Nominal angle conversion
-double degrees(double pulse) {
-    return (
-        pulse - MIN_US
-    ) * 180.0 / (
-        MAX_US - MIN_US
-    );
-}
-
-double pulse_from_deg(double deg) {
-    return MIN_US +
-        deg * (
-            MAX_US - MIN_US
-        ) / 180.0;
-}
-
-double displayed_degrees(const Axis& axis, double pulse) {
-    return degrees(pulse) - degrees(axis.marks.center.value_or(MIN_US));
+std::string show_axis(const Axis& axis) {
+    if (!axis.current) return "OFF";
+    std::string pulse = std::to_string(std::lround(*axis.current)) + "us";
+    if (!axis.marks.center) return pulse + " (center unset)";
+    const auto offset = std::lround(*axis.current - *axis.marks.center);
+    return pulse + " (" + (offset > 0 ? "+" : "") + std::to_string(offset) + "us from center)";
 }
 
 // Store calibration separately from the last position commanded before PWM was disabled.
@@ -551,7 +541,7 @@ int main() {
         std::cout
             << "\nWHISPRYN C++ KEYBOARD CALIBRATION\n"
             << "PAN ch0 A/D | TILT ch2 W/S | arm 1/2\n"
-            << "Z/X speed | N/M step | P/T exact degrees (relative after marking center)\n"
+            << "Z/X speed | N/M step | P/T nominal degrees from your marked center\n"
             << "1/2 or jog selects axis | C mark center | 0 return to center\n"
             << "[ mark lower limit | ] mark upper limit | R reset selected axis marks\n"
             << "H halt/hold | SPACE PWM off | Q quit\n"
@@ -841,15 +831,17 @@ int main() {
                             << "\nArm "
                             << a->name
                             << " first.\n";
+                    } else if (!a->marks.center) {
+                        std::cout << "\nJog to the model's center and press C first.\n";
                     } else {
                         keyboard.normal();
-
+                        const double center = *a->marks.center;
                         std::cout
                             << "\n"
                             << a->name
-                            << (a->marks.center ? " degrees from center " : " nominal target degrees ")
-                            << "(" << displayed_degrees(*a, a->marks.minimum()) << ".."
-                            << displayed_degrees(*a, a->marks.maximum()) << ", blank cancels): "
+                            << " nominal degrees from center ("
+                            << (a->marks.minimum() - center) / US_PER_NOMINAL_DEG << ".."
+                            << (a->marks.maximum() - center) / US_PER_NOMINAL_DEG << ", blank cancels): "
                             << std::flush;
 
                         std::string input;
@@ -864,8 +856,7 @@ int main() {
 
                                 const double angle =
                                     std::stod(input, &used);
-                                const double target = a->marks.center.value_or(MIN_US) +
-                                    angle * (MAX_US - MIN_US) / 180.0;
+                                const double target = center + angle * US_PER_NOMINAL_DEG;
 
                                 if (
                                     used != input.size() ||
@@ -879,10 +870,7 @@ int main() {
                                 }
 
                                 if (
-                                    std::abs(
-                                        angle -
-                                        displayed_degrees(*a, *a->current)
-                                    ) > 20
+                                    std::abs(target - *a->current) > 20 * US_PER_NOMINAL_DEG
                                 ) {
                                     std::cout
                                         << "Large change. "
@@ -941,11 +929,7 @@ int main() {
 
                         a->target = std::clamp(
                             *a->current +
-                            sign * (
-                                pulse_from_deg(
-                                    steps[step_idx]
-                                ) - MIN_US
-                            ),
+                            sign * steps[step_idx] * US_PER_NOMINAL_DEG,
                             a->marks.minimum(),
                             a->marks.maximum()
                         );
@@ -967,8 +951,7 @@ int main() {
             last_time = now;
 
             const double us_per_second =
-                speeds[speed_idx] *
-                (MAX_US - MIN_US) / 180.0;
+                speeds[speed_idx] * US_PER_NOMINAL_DEG;
 
             for (auto* a : {&pan, &tilt}) {
                 if (!a->current || !a->target) {
@@ -1007,35 +990,16 @@ int main() {
                 now - last_report >
                 std::chrono::milliseconds(500)
             ) {
-                auto show = [](const Axis& a) {
-                    if (!a.current) {
-                        return std::string("OFF");
-                    }
-
-                    return std::to_string(
-                        static_cast<int>(
-                            std::lround(
-                                displayed_degrees(a, *a.current)
-                            )
-                        )
-                    ) + "deg* / " +
-                    std::to_string(
-                        static_cast<int>(
-                            std::lround(*a.current)
-                        )
-                    ) + "us";
-                };
-
                 std::ostringstream status;
                 status
-                    << "PAN " << show(pan)
-                    << " | TILT " << show(tilt)
+                    << "PAN " << show_axis(pan)
+                    << " | TILT " << show_axis(tilt)
                     << " | selected " << selected->name
                     << " | speed "
                     << speeds[speed_idx]
-                    << "deg/s | step "
+                    << " nominal deg/s | step "
                     << steps[step_idx]
-                    << "deg";
+                    << " nominal deg";
 
                 const auto line = status.str();
                 if (line != last_status) {
