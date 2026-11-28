@@ -539,7 +539,7 @@ int main() {
 
         std::cout
             << "\nWHISPRYN C++ KEYBOARD CALIBRATION\n"
-            << "PAN ch0 A/D | TILT ch2 W/S | arm 1/2\n"
+            << "PAN ch0 A/D | TILT ch2 W/up (-us), S/down (+us) | arm 1/2\n"
             << "Z/X pulse speed (us/s) | N/M pulse step (us) | P/T pulse offset from center (us)\n"
             << "1/2 or jog selects axis | C mark center | 0 return to center\n"
             << "[ mark lower limit | ] mark upper limit | R reset selected axis marks\n"
@@ -920,11 +920,8 @@ int main() {
                             << " first.\n";
                     } else {
 
-                        const int sign =
-                            (
-                                key == 'd' ||
-                                key == 'w'
-                            ) ? 1 : -1;
+                        // On this mount a shorter tilt pulse moves the camera up.
+                        const int sign = (key == 'd' || key == 's') ? 1 : -1;
 
                         a->target = std::clamp(
                             *a->current +
