@@ -30,18 +30,17 @@ constexpr int PAN_CH = 0;
 constexpr int TILT_CH = 2;
 constexpr int PWM_HZ = 50;
 
-// Electrical safeguards, NOT mechanical limits
-constexpr double MIN_US = 1000;
-constexpr double MAX_US = 2000;
-// Scale for keyboard commands only. The servo does not report shaft angles.
-constexpr double US_PER_NOMINAL_DEG = (MAX_US - MIN_US) / 180.0;
+// PWM signal test range. The mounted mechanism has its own travel limits.
+constexpr double MIN_US = 500;
+constexpr double MAX_US = 3500;
+constexpr double CONFIRM_CHANGE_US = 100;
 
-const std::array<double, 11> speeds{
+const std::array<double, 11> rates_us_per_second{
     3, 5, 10, 20, 30, 40, 60, 80, 100, 150, 200
 };
 
-const std::array<double, 4> steps{
-    1, 2, 5, 10
+const std::array<double, 4> steps_us{
+    5, 10, 25, 50
 };
 
 volatile std::sig_atomic_t running = 1;
@@ -541,7 +540,7 @@ int main() {
         std::cout
             << "\nWHISPRYN C++ KEYBOARD CALIBRATION\n"
             << "PAN ch0 A/D | TILT ch2 W/S | arm 1/2\n"
-            << "Z/X speed | N/M step | P/T nominal degrees from your marked center\n"
+            << "Z/X pulse speed (us/s) | N/M pulse step (us) | P/T pulse offset from center (us)\n"
             << "1/2 or jog selects axis | C mark center | 0 return to center\n"
             << "[ mark lower limit | ] mark upper limit | R reset selected axis marks\n"
             << "H halt/hold | SPACE PWM off | Q quit\n"
@@ -696,7 +695,7 @@ int main() {
                 } else if (key == 'x') {
 
                     speed_idx = std::min(
-                        static_cast<int>(speeds.size()) - 1,
+                        static_cast<int>(rates_us_per_second.size()) - 1,
                         speed_idx + 1
                     );
 
@@ -710,7 +709,7 @@ int main() {
                 } else if (key == 'm') {
 
                     step_idx = std::min(
-                        static_cast<int>(steps.size()) - 1,
+                        static_cast<int>(steps_us.size()) - 1,
                         step_idx + 1
                     );
 
@@ -839,9 +838,9 @@ int main() {
                         std::cout
                             << "\n"
                             << a->name
-                            << " nominal degrees from center ("
-                            << (a->marks.minimum() - center) / US_PER_NOMINAL_DEG << ".."
-                            << (a->marks.maximum() - center) / US_PER_NOMINAL_DEG << ", blank cancels): "
+                            << " pulse offset from center in us ("
+                            << a->marks.minimum() - center << ".."
+                            << a->marks.maximum() - center << ", blank cancels): "
                             << std::flush;
 
                         std::string input;
@@ -854,23 +853,23 @@ int main() {
                             try {
                                 size_t used = 0;
 
-                                const double angle =
+                                const double offset_us =
                                     std::stod(input, &used);
-                                const double target = center + angle * US_PER_NOMINAL_DEG;
+                                const double target = center + offset_us;
 
                                 if (
                                     used != input.size() ||
-                                    !std::isfinite(angle) ||
+                                    !std::isfinite(offset_us) ||
                                     target < a->marks.minimum() ||
                                     target > a->marks.maximum()
                                 ) {
                                     throw std::invalid_argument(
-                                        "angle"
+                                        "pulse offset"
                                     );
                                 }
 
                                 if (
-                                    std::abs(target - *a->current) > 20 * US_PER_NOMINAL_DEG
+                                    std::abs(target - *a->current) > CONFIRM_CHANGE_US
                                 ) {
                                     std::cout
                                         << "Large change. "
@@ -929,7 +928,7 @@ int main() {
 
                         a->target = std::clamp(
                             *a->current +
-                            sign * steps[step_idx] * US_PER_NOMINAL_DEG,
+                            sign * steps_us[step_idx],
                             a->marks.minimum(),
                             a->marks.maximum()
                         );
@@ -951,7 +950,7 @@ int main() {
             last_time = now;
 
             const double us_per_second =
-                speeds[speed_idx] * US_PER_NOMINAL_DEG;
+                rates_us_per_second[speed_idx];
 
             for (auto* a : {&pan, &tilt}) {
                 if (!a->current || !a->target) {
@@ -996,10 +995,10 @@ int main() {
                     << " | TILT " << show_axis(tilt)
                     << " | selected " << selected->name
                     << " | speed "
-                    << speeds[speed_idx]
-                    << " nominal deg/s | step "
-                    << steps[step_idx]
-                    << " nominal deg";
+                    << rates_us_per_second[speed_idx]
+                    << "us/s | step "
+                    << steps_us[step_idx]
+                    << "us";
 
                 const auto line = status.str();
                 if (line != last_status) {
