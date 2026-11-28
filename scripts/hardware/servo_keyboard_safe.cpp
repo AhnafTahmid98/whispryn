@@ -15,6 +15,7 @@
 #include <iomanip>
 #include <iostream>
 #include <optional>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -577,6 +578,7 @@ int main() {
 
         auto last_report = last_time;
         auto last_save = last_time;
+        std::string last_status;
 
         while (running) {
             fd_set rfds;
@@ -1024,16 +1026,22 @@ int main() {
                     ) + "us";
                 };
 
-                std::cout
-                    << "\rPAN " << show(pan)
+                std::ostringstream status;
+                status
+                    << "PAN " << show(pan)
                     << " | TILT " << show(tilt)
                     << " | selected " << selected->name
                     << " | speed "
                     << speeds[speed_idx]
                     << "deg/s | step "
                     << steps[step_idx]
-                    << "deg       "
-                    << std::flush;
+                    << "deg";
+
+                const auto line = status.str();
+                if (line != last_status) {
+                    std::cout << line << '\n' << std::flush;
+                    last_status = line;
+                }
 
                 last_report = now;
             }
