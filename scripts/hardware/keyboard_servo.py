@@ -5,6 +5,7 @@ Nominal degrees are reference values, not measured angles.
 The user determines physical centres and safe travel limits.
 """
 
+import json
 import math
 import os
 import select
@@ -12,6 +13,10 @@ import sys
 import termios
 import time
 import tty
+from dataclasses import asdict, dataclass, replace
+from pathlib import Path
+from tempfile import NamedTemporaryFile
+from typing import Optional
 
 from smbus import SMBus
 from luma.core.interface.serial import i2c
@@ -33,8 +38,68 @@ PWM_HZ = 50
 MIN_US = 1000.0
 MAX_US = 2000.0
 
-SPEEDS = (3, 5, 10, 20, 30, 40, 60, 80)
+SPEEDS = (3, 5, 10, 20, 30, 40, 60, 80, 100, 150, 200)
 STEPS = (1, 2, 5, 10)
+MARKS_FILE = Path(__file__).resolve().parents[2] / "runtime" / "keyboard_servo_marks.json"
+
+
+@dataclass(frozen=True)
+class AxisMarks:
+    center: Optional[float] = None
+    low: Optional[float] = None
+    high: Optional[float] = None
+
+    def __post_init__(self):
+        for pulse in (self.center, self.low, self.high):
+            if pulse is not None and (
+                type(pulse) not in (int, float) or not MIN_US <= pulse <= MAX_US
+            ):
+                raise ValueError("Mark outside the electrical pulse range.")
+        if self.low is not None and (self.center is None or self.low >= self.center):
+            raise ValueError("Mark the lower limit below the center.")
+        if self.high is not None and (self.center is None or self.high <= self.center):
+            raise ValueError("Mark the upper limit above the center.")
+
+    def bounds(self):
+        return (MIN_US if self.low is None else self.low,
+                MAX_US if self.high is None else self.high)
+
+    def degrees(self, pulse):
+        if self.center is None:
+            return us_to_deg(pulse)
+        return us_to_deg(pulse) - us_to_deg(self.center)
+
+    def describe(self):
+        parts = []
+        for name, value in asdict(self).items():
+            pulse = "unset" if value is None else f"{value:.1f} us"
+            parts.append(f"{name} {pulse}")
+        return ", ".join(parts)
+
+
+def load_marks():
+    try:
+        data = json.loads(MARKS_FILE.read_text())
+        if not isinstance(data, dict) or set(data) != set(CHANNELS):
+            raise ValueError("Expected pan and tilt marks.")
+        return {axis: AxisMarks(**data[axis]) for axis in CHANNELS}
+    except FileNotFoundError:
+        return {axis: AxisMarks() for axis in CHANNELS}
+    except (OSError, TypeError, ValueError) as error:
+        raise SystemExit(f"Cannot load {MARKS_FILE}: {error}") from error
+
+
+def save_marks(marks):
+    MARKS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    f = NamedTemporaryFile(mode="w", dir=MARKS_FILE.parent, delete=False)
+    tmp = Path(f.name)
+    try:
+        with f:
+            json.dump({axis: asdict(m) for axis, m in marks.items()}, f, indent=2)
+            f.write("\n")
+        tmp.replace(MARKS_FILE)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def us_to_deg(pulse):
@@ -122,8 +187,10 @@ def main():
     target = {"pan": None, "tilt": None}
     last_ticks = {"pan": None, "tilt": None}
 
+    marks = load_marks()
+    selected = "pan"
     speed_i = 1
-    step_i = 1
+    step_i = 0
 
     def line_input(prompt):
         nonlocal raw
@@ -151,7 +218,7 @@ def main():
                     value = "OFF"
                 else:
                     value = (
-                        f"{us_to_deg(pulse):.0f}* "
+                        f"{marks[axis].degrees(pulse):+.0f}* "
                         f"{pulse:.0f}us"
                     )
 
@@ -184,12 +251,13 @@ def main():
             else:
                 values.append(
                     f"{axis.upper()} "
-                    f"{us_to_deg(pulse):.1f}* "
+                    f"{marks[axis].degrees(pulse):+.1f}* "
                     f"({pulse:.0f}us)"
                 )
 
         print(
             "\r" + " | ".join(values)
+            + f" | Selected {selected.upper()}"
             + f" | Speed {SPEEDS[speed_i]} d/s"
             + f" | Step {STEPS[step_i]} d    ",
             end="",
@@ -206,9 +274,12 @@ def main():
             f"{axis.upper()} suddenly."
         )
 
+        low, high = marks[axis].bounds()
+        if marks[axis].center is not None:
+            print(f"Marked center: {marks[axis].center:.1f} us.")
         value = line_input(
             f"Initial {axis.upper()} pulse "
-            f"({MIN_US:.0f}-{MAX_US:.0f} us, "
+            f"({low:g}-{high:g} us, "
             "blank cancels): "
         )
 
@@ -223,9 +294,9 @@ def main():
 
         if (
             not math.isfinite(pulse)
-            or not MIN_US <= pulse <= MAX_US
+            or not low <= pulse <= high
         ):
-            print("Outside electrical safeguards.")
+            print("Outside allowed pulse range.")
             return
 
         confirmation = line_input(
@@ -256,9 +327,12 @@ def main():
 
         target[axis] = current[axis]
 
+        ref = marks[axis]
+        low, high = ref.bounds()
+        origin = "from marked center" if ref.center is not None else "absolute"
         value = line_input(
-            f"{axis.upper()} nominal target degrees "
-            "(0-180, blank cancels): "
+            f"{axis.upper()} nominal degrees {origin} "
+            f"({ref.degrees(low):+.1f} to {ref.degrees(high):+.1f}, blank cancels): "
         )
 
         if not value:
@@ -270,21 +344,55 @@ def main():
             print("Not a number.")
             return
 
-        if (
-            not math.isfinite(degrees)
-            or not 0 <= degrees <= 180
-        ):
-            print("Outside current pulse reference.")
+        pulse = deg_to_us(degrees) if ref.center is None else (
+            ref.center + degrees * (MAX_US - MIN_US) / 180
+        )
+        if not low <= pulse <= high:
+            print("Outside allowed travel.")
             return
 
-        if abs(degrees - us_to_deg(current[axis])) > 20:
+        if abs(degrees - ref.degrees(current[axis])) > 20:
             if line_input(
                 "Large command. Type YES: "
             ) != "YES":
                 print("Cancelled.")
                 return
 
-        target[axis] = deg_to_us(degrees)
+        target[axis] = pulse
+
+    def calibration_key(axis, key):
+        ref = marks[axis]
+        pulse = current[axis]
+        if key == "r":
+            target[axis] = pulse
+            if line_input(f"Type RESET to clear {axis.upper()} center and limits: ") != "RESET":
+                return
+            updated = AxisMarks()
+        elif pulse is None:
+            print(f"\nArm {axis.upper()} first.")
+            return
+        elif key == "0":
+            if ref.center is None:
+                print("\nJog to center and press C first.")
+            else:
+                target[axis] = ref.center
+            return
+        else:
+            # Mark the current command and cancel any remaining jog.
+            target[axis] = pulse
+            field = {"c": "center", "[": "low", "]": "high"}[key]
+            try:
+                updated = replace(ref, **{field: pulse})
+            except ValueError as error:
+                print(f"\n{error}")
+                return
+        try:
+            save_marks({**marks, axis: updated})
+        except OSError as error:
+            print(f"\nCould not save calibration: {error}")
+            return
+        marks[axis] = updated
+        print(f"\n{axis.upper()} saved: {updated.describe()}")
 
     try:
         bus = SMBus(PCA_BUS)
@@ -306,17 +414,25 @@ def main():
 
         print("\nWHISPRYN KEYBOARD CALIBRATION")
         print("--------------------------------")
-        print("1/2  : Arm PAN / TILT")
+        print("1/2  : Select and arm PAN / TILT")
         print("A/D  : PAN left/right")
         print("W/S  : TILT up/down")
         print("Z/X  : Decrease/increase speed")
         print("N/M  : Decrease/increase degree step")
-        print("P/T  : Exact nominal degree target")
+        print("Jog or press 1/2 to select the axis for the following keys:")
+        print("C    : Mark current position as center (0 deg)")
+        print("[ / ]: Mark lower / upper travel limit, short of the physical stop")
+        print("0    : Return selected axis to center at selected speed")
+        print("R    : Clear selected axis marks to recalibrate")
+        print("P/T  : Exact PAN / TILT degrees, relative to center once marked")
         print("H    : Halt and hold")
         print("SPACE: Disable PWM")
         print("Q    : Quit")
         print("--------------------------------")
-        print("No mechanical centre assumed.")
+        print("First setup with unknown position: disconnect the linkage before ARM.")
+        print("1500 us is the electrical midpoint. Jog to find the mounted center.")
+        for axis, ref in marks.items():
+            print(f"{axis.upper()} marks: {ref.describe()}")
 
         tty.setcbreak(fd)
         raw = True
@@ -342,13 +458,17 @@ def main():
                     print("\nPWM disabled.")
 
                 elif key in ("1", "2"):
-                    arm("pan" if key == "1" else "tilt")
+                    selected = "pan" if key == "1" else "tilt"
+                    arm(selected)
+                    last = time.monotonic()
+
+                elif key in ("c", "[", "]", "0", "r"):
+                    calibration_key(selected, key)
                     last = time.monotonic()
 
                 elif key in ("p", "t"):
-                    exact_target(
-                        "pan" if key == "p" else "tilt"
-                    )
+                    selected = "pan" if key == "p" else "tilt"
+                    exact_target(selected)
                     last = time.monotonic()
 
                 elif key == "h":
@@ -361,6 +481,7 @@ def main():
                         "pan" if key in ("a", "d")
                         else "tilt"
                     )
+                    selected = axis
 
                     if target[axis] is None:
                         print(
@@ -371,17 +492,18 @@ def main():
                             1 if key in ("d", "w") else -1
                         )
 
-                        # Accumulate from TARGET, not current.
+                        # Keep at most one jog ahead while exploring unknown travel.
                         delta_us = (
                             deg_to_us(STEPS[step_i])
                             - MIN_US
                         )
 
+                        low, high = marks[axis].bounds()
                         target[axis] = max(
-                            MIN_US,
+                            low,
                             min(
-                                MAX_US,
-                                target[axis]
+                                high,
+                                current[axis]
                                 + direction * delta_us,
                             ),
                         )
@@ -403,8 +525,6 @@ def main():
                         len(STEPS) - 1,
                         step_i + 1,
                     )
-
-                status()
 
             now = time.monotonic()
             dt = min(max(now - last, 0), 0.1)
@@ -449,6 +569,7 @@ def main():
 
             if now - last_oled >= 0.2:
                 draw()
+                status()
                 last_oled = now
 
     except KeyboardInterrupt:
