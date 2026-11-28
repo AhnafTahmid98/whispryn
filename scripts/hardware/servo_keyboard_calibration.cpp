@@ -40,6 +40,9 @@ const std::array<double, 11> rates_us_per_second{
     3, 5, 10, 20, 30, 40, 60, 80, 100, 150, 200
 };
 
+// Start pan at the 5 us/s setting, or keep a slower selection.
+constexpr int PAN_START_RATE_INDEX = 1;
+
 const std::array<double, 4> steps_us{
     5, 10, 25, 50
 };
@@ -354,6 +357,46 @@ void enable_axis(PCA9685& board, Axis& axis, double pulse) {
     axis.last_ticks = ticks_for(pulse);
 }
 
+// The SG90 cannot report its position. Ask which pulse matches the shaft
+// before enabling PWM; only subsequent position commands can be rate limited.
+std::optional<double> confirm_pan_start(Terminal& keyboard, const Axis& pan, double rate) {
+    const double low = pan.marks.minimum();
+    const double high = pan.marks.maximum();
+    const bool can_resume = pan.saved && *pan.saved >= low && *pan.saved <= high;
+    std::ostringstream prompt;
+    if (pan.marks.center) {
+        prompt << "PAN startup target: marked center " << *pan.marks.center
+               << " us, starting at " << rate << " us/s.\n";
+    } else {
+        prompt << "PAN center unset: hold the initial pulse until you jog.\n";
+    }
+    if (can_resume) {
+        prompt << "Last commanded PAN: " << *pan.saved << " us. "
+               << "Type ARM only if the shaft is still at that position.\n";
+    }
+    prompt << "Enter a known pulse matching PAN's current position ("
+           << low << ".." << high << " us, blank cancels): ";
+    const auto input = keyboard.ask(prompt.str());
+    if (input.empty()) return std::nullopt;
+    if (can_resume && input == "ARM") return pan.saved;
+
+    double pulse;
+    try {
+        std::size_t used = 0;
+        pulse = std::stod(input, &used);
+        if (used != input.size() || !std::isfinite(pulse) || pulse < low || pulse > high)
+            throw std::invalid_argument("pulse");
+    } catch (const std::logic_error&) {
+        std::cout << "\nInvalid initial pulse. PAN stays off.\n";
+        return std::nullopt;
+    }
+    std::ostringstream confirm;
+    confirm << "Type ARM to start PAN at " << pulse
+            << " us (first move may jump if the position differs): ";
+    if (keyboard.ask(confirm.str()) != "ARM") return std::nullopt;
+    return pulse;
+}
+
 // Load last commanded positions
 void read_saved(
     const fs::path& file,
@@ -407,6 +450,7 @@ void persist(
         );
     }
 
+    out << std::setprecision(17);
     if (pan.current) {
         out << "pan " << *pan.current << "\n";
     } else if (pan.saved) {
@@ -540,7 +584,7 @@ int main() {
             tilt
         );
 
-        int speed_idx = 1;
+        int speed_idx = PAN_START_RATE_INDEX;
         int step_idx = 0;
         Axis* selected = &pan;
 
@@ -548,7 +592,7 @@ int main() {
 
         std::cout
             << "\nWHISPRYN C++ KEYBOARD CALIBRATION\n"
-            << "1 arm PAN (ch0), A/D jog | 2 arm fixed TILT (ch2) at " << FIXED_TILT_US << " us\n"
+            << "1 arm PAN and ease to marked center (ch0), A/D jog | 2 arm fixed TILT (ch2) at " << FIXED_TILT_US << " us\n"
             << "PAN: Z/X pulse speed (us/s) | N/M pulse step (us) | P pulse offset from center (us)\n"
             << "PAN: C mark center | 0 return to center\n"
             << "[ mark lower limit | ] mark upper limit | R reset selected axis marks\n"
@@ -743,102 +787,22 @@ int main() {
                     }
                 } else if (key == 'w' || key == 's' || key == 't') {
                     std::cout << "\nTILT is fixed at " << FIXED_TILT_US << " us.\n";
-                } else if (key == '1' && a) {
-
-                    if (a->current) {
-                        std::cout
-                            << "\n"
-                            << a->name
-                            << " already armed.\n";
+                } else if (key == '1') {
+                    if (pan.current) {
+                        std::cout << "\nPAN already armed.\n";
                     } else {
-
-                        keyboard.normal();
-
-                        std::cout
-                            << "\nLast saved "
-                            << a->name
-                            << ": "
-                            << (
-                                a->saved
-                                ? std::to_string(*a->saved) + " us"
-                                : "unknown"
-                            )
-                            << "\n";
-
-                        std::cout
-                            << "Servo may have moved while off. "
-                            << "Enter INITIAL pulse "
-                            << "(" << a->marks.minimum() << ".." << a->marks.maximum()
-                            << " us, blank cancels): "
-                            << std::flush;
-
-                        std::string input;
-                        std::getline(
-                            std::cin,
-                            input
-                        );
-
-                        if (!input.empty()) {
-                            try {
-                                size_t used = 0;
-
-                                const double pulse =
-                                    std::stod(input, &used);
-
-                                if (
-                                    used != input.size() ||
-                                    !std::isfinite(pulse) ||
-                                    pulse < a->marks.minimum() ||
-                                    pulse > a->marks.maximum()
-                                ) {
-                                    throw std::invalid_argument(
-                                        "pulse"
-                                    );
-                                }
-
-                                std::cout
-                                    << "Type ARM to send this first command "
-                                    << "(may jump): "
-                                    << std::flush;
-
-                                std::string confirmation;
-
-                                std::getline(
-                                    std::cin,
-                                    confirmation
-                                );
-
-                                if (confirmation == "ARM") {
-                                    enable_axis(board, *a, pulse);
-
-                                    persist(
-                                        state,
-                                        pan,
-                                        tilt
-                                    );
-
-                                    std::cout
-                                        << a->name
-                                        << " ARMED at "
-                                        << pulse
-                                        << " us\n";
-                                } else {
-                                    std::cout
-                                        << "Cancelled.\n";
-                                }
-
-                            } catch (...) {
-                                std::cout
-                                    << "Invalid initial pulse.\n";
-                            }
+                        const int start_rate_idx = std::min(speed_idx, PAN_START_RATE_INDEX);
+                        const auto pulse = confirm_pan_start(keyboard, pan, rates_us_per_second[start_rate_idx]);
+                        if (pulse && running) {
+                            enable_axis(board, pan, *pulse);
+                            pan.target = pan.marks.center.value_or(*pulse);
+                            speed_idx = start_rate_idx;
+                            persist(state, pan, tilt);
+                            std::cout << "\nPAN ARMED at " << *pulse << " us; target "
+                                      << *pan.target << " us.\n";
                         }
-
-                        keyboard.raw();
-
-                        last_time =
-                            std::chrono::steady_clock::now();
+                        last_time = std::chrono::steady_clock::now();
                     }
-
                 } else if (key == 'p' && a) {
 
                     if (!a->current) {
