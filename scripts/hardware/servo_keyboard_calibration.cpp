@@ -28,6 +28,7 @@ namespace fs = std::filesystem;
 constexpr int PCA_ADDR = 0x40;
 constexpr int PAN_CH = 0;
 constexpr int TILT_CH = 2;
+constexpr double PAN_START_US = 1866.44;
 constexpr int FIXED_TILT_US = 2583;
 constexpr int PWM_HZ = 50;
 
@@ -357,46 +358,6 @@ void enable_axis(PCA9685& board, Axis& axis, double pulse) {
     axis.last_ticks = ticks_for(pulse);
 }
 
-// The SG90 cannot report its position. Ask which pulse matches the shaft
-// before enabling PWM; only subsequent position commands can be rate limited.
-std::optional<double> confirm_pan_start(Terminal& keyboard, const Axis& pan, double rate) {
-    const double low = pan.marks.minimum();
-    const double high = pan.marks.maximum();
-    const bool can_resume = pan.saved && *pan.saved >= low && *pan.saved <= high;
-    std::ostringstream prompt;
-    if (pan.marks.center) {
-        prompt << "PAN startup target: marked center " << *pan.marks.center
-               << " us, starting at " << rate << " us/s.\n";
-    } else {
-        prompt << "PAN center unset: hold the initial pulse until you jog.\n";
-    }
-    if (can_resume) {
-        prompt << "Last commanded PAN: " << *pan.saved << " us. "
-               << "Type ARM only if the shaft is still at that position.\n";
-    }
-    prompt << "Enter a known pulse matching PAN's current position ("
-           << low << ".." << high << " us, blank cancels): ";
-    const auto input = keyboard.ask(prompt.str());
-    if (input.empty()) return std::nullopt;
-    if (can_resume && input == "ARM") return pan.saved;
-
-    double pulse;
-    try {
-        std::size_t used = 0;
-        pulse = std::stod(input, &used);
-        if (used != input.size() || !std::isfinite(pulse) || pulse < low || pulse > high)
-            throw std::invalid_argument("pulse");
-    } catch (const std::logic_error&) {
-        std::cout << "\nInvalid initial pulse. PAN stays off.\n";
-        return std::nullopt;
-    }
-    std::ostringstream confirm;
-    confirm << "Type ARM to start PAN at " << pulse
-            << " us (first move may jump if the position differs): ";
-    if (keyboard.ask(confirm.str()) != "ARM") return std::nullopt;
-    return pulse;
-}
-
 // Load last commanded positions
 void read_saved(
     const fs::path& file,
@@ -592,16 +553,15 @@ int main() {
 
         std::cout
             << "\nWHISPRYN C++ KEYBOARD CALIBRATION\n"
-            << "1 arm PAN and ease to marked center (ch0), A/D jog | 2 arm fixed TILT (ch2) at " << FIXED_TILT_US << " us\n"
+            << "1 arm PAN (ch0) at " << PAN_START_US << " us, A/D jog | 2 arm fixed TILT (ch2) at " << FIXED_TILT_US << " us\n"
             << "PAN: Z/X pulse speed (us/s) | N/M pulse step (us) | P pulse offset from center (us)\n"
             << "PAN: C mark center | 0 return to center\n"
             << "[ mark lower limit | ] mark upper limit | R reset selected axis marks\n"
             << "H halt/hold | SPACE PWM off | Q quit\n"
-            << "No auto-start command; no mechanical centre assumed.\n"
-            << "First ARM may still jump if the servo moved unpowered.\n";
+            << "Outputs stay off until armed. The first move may be fast if the shaft is away from its startup position.\n";
 
         std::cout
-            << "Saved reference: PAN "
+            << "Last commanded: PAN "
             << (
                 pan.saved
                 ? std::to_string(*pan.saved)
@@ -790,16 +750,18 @@ int main() {
                 } else if (key == '1') {
                     if (pan.current) {
                         std::cout << "\nPAN already armed.\n";
+                    } else if (PAN_START_US < pan.marks.minimum() || PAN_START_US > pan.marks.maximum()) {
+                        std::cout << "\nPAN startup pulse is outside saved limits. PAN stays off.\n";
                     } else {
-                        const int start_rate_idx = std::min(speed_idx, PAN_START_RATE_INDEX);
-                        const auto pulse = confirm_pan_start(keyboard, pan, rates_us_per_second[start_rate_idx]);
-                        if (pulse && running) {
-                            enable_axis(board, pan, *pulse);
-                            pan.target = pan.marks.center.value_or(*pulse);
-                            speed_idx = start_rate_idx;
+                        std::ostringstream prompt;
+                        prompt << "Type ARM to start PAN at " << PAN_START_US << " us (Enter cancels): ";
+                        if (keyboard.ask(prompt.str()) == "ARM" && running) {
+                            enable_axis(board, pan, PAN_START_US);
+                            speed_idx = std::min(speed_idx, PAN_START_RATE_INDEX);
                             persist(state, pan, tilt);
-                            std::cout << "\nPAN ARMED at " << *pulse << " us; target "
-                                      << *pan.target << " us.\n";
+                            std::cout << "\nPAN ARMED at " << PAN_START_US << " us.\n";
+                        } else {
+                            std::cout << "\nCancelled.\n";
                         }
                         last_time = std::chrono::steady_clock::now();
                     }
